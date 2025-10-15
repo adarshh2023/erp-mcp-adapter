@@ -51,12 +51,11 @@ async function erp(path, method = "GET", body) {
   return data;
 }
 
-// ---------- tool catalog (include camelCase + snake_case for max compatibility)
+// ---------- tool catalog
 function toolCatalog() {
   const tools = [
     {
       name: "generateIndentNumber",
-      title: "Generate Indent Number",
       description:
         "GET /api/v1/indents/generate-number → returns indent number in data",
       inputSchema: {
@@ -64,22 +63,11 @@ function toolCatalog() {
         properties: {},
         additionalProperties: false,
       },
-      input_schema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
     },
     {
       name: "listLocations",
-      title: "List Locations",
       description: "GET /api/v1/locations → locations in data.content",
       inputSchema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-      input_schema: {
         type: "object",
         properties: {},
         additionalProperties: false,
@@ -87,14 +75,8 @@ function toolCatalog() {
     },
     {
       name: "listItems",
-      title: "List Items",
       description: "GET /api/v1/items → items in data.content",
       inputSchema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-      input_schema: {
         type: "object",
         properties: {},
         additionalProperties: false,
@@ -102,14 +84,8 @@ function toolCatalog() {
     },
     {
       name: "listUnits",
-      title: "List Units",
       description: "GET /api/v1/units → units in data.content",
       inputSchema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-      input_schema: {
         type: "object",
         properties: {},
         additionalProperties: false,
@@ -117,71 +93,9 @@ function toolCatalog() {
     },
     {
       name: "createIndent",
-      title: "Create Indent",
       description:
         "POST /api/v1/indents → creates an indent with the ERP JSON body",
       inputSchema: {
-        type: "object",
-        properties: {
-          indentNumber: { type: "string" },
-          indentTitle: { type: "string" },
-          indentDescription: { type: "string" },
-          indentType: { type: "string" },
-          priority: { type: "string" },
-          projectNodeId: { type: "string" },
-          locationId: { type: "string" },
-          requestedById: { type: "string" },
-          requestorDepartment: { type: "string" },
-          requestedDate: { type: "string" },
-          requiredByDate: { type: "string" },
-          purposeOfIndent: { type: "string" },
-          workDescription: { type: "string" },
-          justification: { type: "string" },
-          estimatedBudget: { type: "number" },
-          budgetCode: { type: "string" },
-          requiresApproval: { type: "boolean" },
-          isUrgent: { type: "boolean" },
-          deliveryInstructions: { type: "string" },
-          qualityRequirements: { type: "string" },
-          indentNotes: { type: "string" },
-          indentItems: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                itemMasterId: { type: "string" },
-                requiredQuantity: { type: "number" },
-                unit: { type: "string" },
-                estimatedRate: { type: "number" },
-                estimatedAmount: { type: "number" },
-                requiredByDate: { type: "string" },
-                isTestingRequired: { type: "boolean" },
-                purposeOfItem: { type: "string" },
-                itemNotes: { type: "string" },
-              },
-              required: [
-                "itemMasterId",
-                "requiredQuantity",
-                "unit",
-                "requiredByDate",
-              ],
-            },
-          },
-          deviceId: { type: "string" },
-          ipAddress: { type: "string" },
-        },
-        required: [
-          "indentNumber",
-          "projectNodeId",
-          "locationId",
-          "requestedById",
-          "requestedDate",
-          "requiredByDate",
-          "indentItems",
-        ],
-        additionalProperties: true,
-      },
-      input_schema: {
         type: "object",
         properties: {
           indentNumber: { type: "string" },
@@ -249,7 +163,7 @@ function toolCatalog() {
 
 // ---------- MCP JSON-RPC handlers
 
-// health - Enhanced with MCP info
+// health
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
@@ -261,24 +175,30 @@ app.get("/", (_req, res) => {
     },
   });
 });
-app.options("/", (_req, res) => res.sendStatus(204));
 
-// root JSON-RPC multiplexer - ENHANCED with initialize
+// root JSON-RPC multiplexer - HANDLES OPENAI'S SPECIFIC FORMAT
 app.post("/", async (req, res) => {
-  const { id, method, params } = req.body || {};
+  const { id, method, params, jsonrpc } = req.body || {};
 
   try {
-    // IMPORTANT: Handle initialize method
+    // Handle initialize with OpenAI's protocol version
     if (method === "initialize") {
+      const clientInfo = params?.clientInfo || {};
+      const protocolVersion = params?.protocolVersion || "2025-06-18";
+
+      console.log(
+        `Initialize request from: ${clientInfo.name}, protocol: ${protocolVersion}`
+      );
+
       return res.json({
         jsonrpc: "2.0",
         id,
         result: {
-          protocolVersion: "1.0.0",
+          protocolVersion: protocolVersion, // Echo back the client's protocol version
           capabilities: {
-            tools: {},
-            resources: null,
-            prompts: null,
+            tools: {}, // Empty object, not null
+            resources: {},
+            prompts: {},
           },
           serverInfo: {
             name: "erp-mcp-adapter",
@@ -292,54 +212,74 @@ app.post("/", async (req, res) => {
       return res.json({
         jsonrpc: "2.0",
         id,
-        result: { tools: toolCatalog(), nextCursor: null },
+        result: {
+          tools: toolCatalog(),
+        },
       });
     }
 
     if (method === "tools/call") {
       const { name, arguments: args = {} } = params || {};
+      console.log(`Tool call: ${name}`, args);
+
       const result = await handleToolCall(name, args);
+
+      // Return in the format OpenAI expects
       return res.json({
         jsonrpc: "2.0",
         id,
         result: {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          isError: false,
+          content: [
+            {
+              type: "text",
+              text:
+                typeof result === "string"
+                  ? result
+                  : JSON.stringify(result, null, 2),
+            },
+          ],
         },
       });
     }
 
-    return res.status(400).json({
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32601, message: `Unknown method: ${method}` },
-    });
-  } catch (err) {
-    console.error("Error handling request:", err);
-    return res.status(err?.status || 500).json({
+    // Unknown method
+    console.log(`Unknown method: ${method}`);
+    return res.json({
       jsonrpc: "2.0",
       id,
       error: {
-        code: err?.status || -32603,
-        message: err?.message || "Internal error",
-        data: err?.data || err,
+        code: -32601,
+        message: `Method not found: ${method}`,
+      },
+    });
+  } catch (err) {
+    console.error("Error handling request:", err);
+    return res.json({
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: err?.message || err,
       },
     });
   }
 });
 
-// explicit initialize endpoint
+// Explicit endpoints for other clients
 app.post("/initialize", (req, res) => {
-  const id = req.body?.id ?? null;
+  const { id, params } = req.body || {};
+  const protocolVersion = params?.protocolVersion || "2025-06-18";
+
   res.json({
     jsonrpc: "2.0",
     id,
     result: {
-      protocolVersion: "1.0.0",
+      protocolVersion: protocolVersion,
       capabilities: {
         tools: {},
-        resources: null,
-        prompts: null,
+        resources: {},
+        prompts: {},
       },
       serverInfo: {
         name: "erp-mcp-adapter",
@@ -349,150 +289,93 @@ app.post("/initialize", (req, res) => {
   });
 });
 
-// explicit endpoints (some clients use these)
 app.post("/tools/list", (req, res) => {
   const id = req.body?.id ?? null;
   res.json({
     jsonrpc: "2.0",
     id,
-    result: { tools: toolCatalog(), nextCursor: null },
+    result: {
+      tools: toolCatalog(),
+    },
   });
 });
 
 app.post("/tools/call", async (req, res) => {
   const id = req.body?.id ?? null;
   const { name, arguments: args = {} } = req.body?.params || {};
+
   try {
     const result = await handleToolCall(name, args);
     res.json({
       jsonrpc: "2.0",
       id,
       result: {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        isError: false,
+        content: [
+          {
+            type: "text",
+            text:
+              typeof result === "string"
+                ? result
+                : JSON.stringify(result, null, 2),
+          },
+        ],
       },
     });
   } catch (err) {
     console.error("Tool call error:", err);
-    res.status(err?.status || 500).json({
+    res.json({
       jsonrpc: "2.0",
       id,
       error: {
-        code: err?.status || -32603,
-        message: err?.message || "Tool execution failed",
-        data: err?.data || err,
+        code: -32603,
+        message: "Tool execution failed",
+        data: err?.message || err,
       },
     });
   }
 });
 
-// /mcp endpoint with full handling
-app.post("/mcp", async (req, res) => {
-  const { id, method, params } = req.body || {};
-
-  try {
-    if (method === "initialize") {
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          protocolVersion: "1.0.0",
-          capabilities: {
-            tools: {},
-            resources: null,
-            prompts: null,
-          },
-          serverInfo: {
-            name: "erp-mcp-adapter",
-            version: "1.0.0",
-          },
-        },
-      });
-    }
-
-    if (method === "tools/list") {
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: { tools: toolCatalog(), nextCursor: null },
-      });
-    }
-
-    if (method === "tools/call") {
-      const { name, arguments: args = {} } = params || {};
-      const result = await handleToolCall(name, args);
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          isError: false,
-        },
-      });
-    }
-
-    return res.status(400).json({
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32601, message: `Unknown method: ${method}` },
-    });
-  } catch (err) {
-    console.error("MCP endpoint error:", err);
-    return res.status(err?.status || 500).json({
-      jsonrpc: "2.0",
-      id,
-      error: {
-        code: err?.status || -32603,
-        message: err?.message || "Internal error",
-        data: err?.data || err,
-      },
-    });
-  }
-});
-
+// OPTIONS for all endpoints
 app.options("/initialize", (_req, res) => res.sendStatus(204));
 app.options("/tools/list", (_req, res) => res.sendStatus(204));
 app.options("/tools/call", (_req, res) => res.sendStatus(204));
 app.options("/mcp", (_req, res) => res.sendStatus(204));
 
-// GET endpoint for tools (for debugging)
+// GET endpoint for debugging
 app.get("/tools", (_req, res) => {
   res.json({ tools: toolCatalog() });
 });
 
 // ---- actual tool execution
 async function handleToolCall(name, args) {
-  console.log(`Executing tool: ${name} with args:`, args);
+  console.log(
+    `Executing tool: ${name} with args:`,
+    JSON.stringify(args, null, 2)
+  );
 
-  switch (name) {
-    case "generateIndentNumber":
-      return await erp("/api/v1/indents/generate-number", "GET");
-    case "listLocations":
-      return await erp("/api/v1/locations", "GET");
-    case "listItems":
-      return await erp("/api/v1/items", "GET");
-    case "listUnits":
-      return await erp("/api/v1/units", "GET");
-    case "createIndent":
-      return await erp("/api/v1/indents", "POST", args);
-    default:
-      throw {
-        status: 404,
-        message: `Unknown tool: ${name}`,
-        data: { error: `Unknown tool: ${name}` },
-      };
+  try {
+    switch (name) {
+      case "generateIndentNumber":
+        return await erp("/api/v1/indents/generate-number", "GET");
+      case "listLocations":
+        return await erp("/api/v1/locations", "GET");
+      case "listItems":
+        return await erp("/api/v1/items", "GET");
+      case "listUnits":
+        return await erp("/api/v1/units", "GET");
+      case "createIndent":
+        return await erp("/api/v1/indents", "POST", args);
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  } catch (error) {
+    console.error(`Tool execution error for ${name}:`, error);
+    throw error;
   }
 }
 
 app.listen(PORT, () => {
   console.log(`MCP adapter listening on :${PORT}`);
   console.log(`ERP_BASE=${ERP_BASE}`);
-  console.log(`Endpoints available:`);
-  console.log(`  - GET  / (health check)`);
-  console.log(`  - POST / (JSON-RPC multiplexer)`);
-  console.log(`  - POST /initialize`);
-  console.log(`  - POST /tools/list`);
-  console.log(`  - POST /tools/call`);
-  console.log(`  - POST /mcp`);
-  console.log(`  - GET  /tools (debug)`);
+  console.log(`Ready for OpenAI MCP connections`);
 });
