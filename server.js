@@ -6,6 +6,17 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// --- CORS middleware ---
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*"); // or restrict to https://platform.openai.com
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.setHeader("Access-Control-Max-Age", "600");
+  res.setHeader("Cache-Control", "no-store");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 const PORT = process.env.PORT || 4000;
 const ERP_BASE = (process.env.ERP_BASE || "").replace(/\/$/, "");
 const ERP_TOKEN = process.env.ERP_TOKEN;
@@ -34,14 +45,18 @@ async function erp(path, method = "GET", body) {
   return data;
 }
 
-// ---- MCP: list available tools (discovery) ----
-app.get("/tools", (req, res) => {
+// ---- health (Builder may probe root) ----
+app.get("/", (_req, res) => res.json({ ok: true, service: "erp-mcp-adapter" }));
+app.options("/", (_req, res) => res.sendStatus(204));
+
+// ---- MCP: list tools ----
+app.get("/tools", (_req, res) => {
   res.json({
     tools: [
       {
         name: "generateIndentNumber",
         description:
-          "GET /api/v1/indents/generate-number → returns indent number string in data",
+          "GET /api/v1/indents/generate-number → returns indent number in result.data.data",
         input_schema: {
           type: "object",
           properties: {},
@@ -51,7 +66,7 @@ app.get("/tools", (req, res) => {
       {
         name: "listLocations",
         description:
-          "GET /api/v1/locations → returns paged locations in data.content",
+          "GET /api/v1/locations → returns paged locations in result.data.data.content",
         input_schema: {
           type: "object",
           properties: {},
@@ -60,7 +75,8 @@ app.get("/tools", (req, res) => {
       },
       {
         name: "listItems",
-        description: "GET /api/v1/items → returns paged items in data.content",
+        description:
+          "GET /api/v1/items → returns paged items in result.data.data.content",
         input_schema: {
           type: "object",
           properties: {},
@@ -69,7 +85,8 @@ app.get("/tools", (req, res) => {
       },
       {
         name: "listUnits",
-        description: "GET /api/v1/units → returns paged units in data.content",
+        description:
+          "GET /api/v1/units → returns paged units in result.data.data.content",
         input_schema: {
           type: "object",
           properties: {},
@@ -79,7 +96,7 @@ app.get("/tools", (req, res) => {
       {
         name: "createIndent",
         description:
-          "POST /api/v1/indents → creates an indent. Uses exact ERP JSON shape.",
+          "POST /api/v1/indents → creates an indent with the exact ERP JSON shape.",
         input_schema: {
           type: "object",
           properties: {
@@ -139,17 +156,18 @@ app.get("/tools", (req, res) => {
             "requiredByDate",
             "indentItems",
           ],
+          additionalProperties: true,
         },
       },
     ],
   });
 });
+app.options("/tools", (_req, res) => res.sendStatus(204));
 
-// ---- MCP: invoke a tool ----
+// ---- MCP: invoke tool ----
 app.post("/tools/:name", async (req, res) => {
   const name = req.params.name;
   const args = req.body || {};
-
   try {
     switch (name) {
       case "generateIndentNumber": {
@@ -169,8 +187,7 @@ app.post("/tools/:name", async (req, res) => {
         return res.json({ ok: true, result: data });
       }
       case "createIndent": {
-        const payload = args; // expect exact ERP payload
-        const data = await erp("/api/v1/indents", "POST", payload);
+        const data = await erp("/api/v1/indents", "POST", args);
         return res.json({ ok: true, result: data });
       }
       default:
@@ -183,9 +200,7 @@ app.post("/tools/:name", async (req, res) => {
     return res.status(status).json({ ok: false, error: err });
   }
 });
-
-// health
-app.get("/", (req, res) => res.json({ ok: true, service: "erp-mcp-adapter" }));
+app.options("/tools/:name", (_req, res) => res.sendStatus(204));
 
 app.listen(PORT, () => {
   console.log(`MCP adapter listening on :${PORT}`);
