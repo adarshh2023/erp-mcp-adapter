@@ -65,6 +65,15 @@ function toolCatalog() {
       },
     },
     {
+      name: "fetchProjects",
+      description: "GET /api/v1/projects → projects in data.content",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+    {
       name: "listLocations",
       description: "GET /api/v1/locations → locations in data.content",
       inputSchema: {
@@ -357,6 +366,8 @@ async function handleToolCall(name, args) {
     switch (name) {
       case "generateIndentNumber":
         return await erp("/api/v1/indents/generate-number", "GET");
+      case "fetchProjects":
+        return await erp("/api/v1/projects", "GET");
       case "listLocations":
         return await erp("/api/v1/locations", "GET");
       case "listItems":
