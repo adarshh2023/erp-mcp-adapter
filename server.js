@@ -35,7 +35,8 @@ async function erp(path, method = "GET", body) {
   const res = await fetch(url, {
     method,
     headers: {
-      Authorization: ERP_TOKEN,
+      Authorization:
+        "Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MDY4MjI5NCwiZXhwIjoxNzYwNzY4Njk0fQ.OpU8dqnwSpkcyUzwZbRkDCh0i_x4x9U3sXQBkO_6Df_T-_gFVMCTkvUq4eNfXIuyEJRVMtAqnFfd_4lNnLCujQ",
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
