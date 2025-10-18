@@ -36,7 +36,7 @@ async function erp(path, method = "GET", body) {
     method,
     headers: {
       Authorization:
-        "Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MDY4MjI5NCwiZXhwIjoxNzYwNzY4Njk0fQ.OpU8dqnwSpkcyUzwZbRkDCh0i_x4x9U3sXQBkO_6Df_T-_gFVMCTkvUq4eNfXIuyEJRVMtAqnFfd_4lNnLCujQ",
+        "Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MDc3OTYyOCwiZXhwIjoxNzYwODY2MDI4fQ.W6mrdlV7eATeQZu_JUGls8JFQ79iRS1r73bMDjEwf-HLGqDbi4GDK8MK8Z0IYIR6bX4NcPunopVdZwMjkGey4g",
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
