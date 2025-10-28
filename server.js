@@ -1,115 +1,277 @@
+// mcp-server.js - COMPLETE FIXED VERSION
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import Ajv from "ajv";
+import addFormats from "ajv-formats";
+
 dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ---- basic request logger (remove after debugging)
+// ---------- basic logger (redacts auth) ----------
 app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${req.method} ${req.path}`);
   if (req.body && Object.keys(req.body).length > 0) {
-    console.log("Body:", JSON.stringify(req.body, null, 2));
+    // Avoid printing large payloads or secrets
+    const clone = JSON.parse(JSON.stringify(req.body));
+    if (clone?.params?.headers?.Authorization) {
+      clone.params.headers.Authorization = "REDACTED";
+    }
+    console.log("Body:", JSON.stringify(clone, null, 2));
   }
   next();
 });
 
-// ---- CORS (Agent Builder runs at https://platform.openai.com)
+// ---------- CORS (adjust origin in prod) ----------
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Origin", "*"); // tighten in production
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type,Authorization,X-ERP-Base-Url"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
   res.setHeader("Access-Control-Max-Age", "600");
   res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
+// ---------- config ----------
 const PORT = process.env.PORT || 4000;
-const ENV_ERP_BASE = (process.env.ERP_BASE || "").replace(/\/$/, "");
-const ENV_ERP_TOKEN = process.env.ERP_TOKEN || "";
-
-/**
- * Resolve ERP base URL and headers from the current request.
- * Allows Agent SDK to pass Authorization & X-ERP-Base-Url dynamically.
- */
-function resolveErpContext(req) {
-  const headerBase = (req.get("X-ERP-Base-Url") || "").replace(/\/$/, "");
-  const base = headerBase || ENV_ERP_BASE;
-  const authHeader =
-    req.get("Authorization") ||
-    (ENV_ERP_TOKEN ? `Bearer ${ENV_ERP_TOKEN}` : "");
-  return { base, authHeader };
+const ERP_BASE = (process.env.ERP_BASE || "").replace(/\/$/, "");
+const ERP_API_KEY = process.env.ERP_API_KEY;
+if (!ERP_BASE) {
+  console.error("Missing ERP_BASE");
+  process.exit(1);
+}
+if (!ERP_API_KEY) {
+  console.error("Missing ERP_API_KEY");
+  process.exit(1);
 }
 
-async function erp(req, path, method = "GET", body) {
-  const { base, authHeader } = resolveErpContext(req);
-  if (!base) {
-    throw new Error(
-      "ERP_BASE is not configured (missing X-ERP-Base-Url header or ENV ERP_BASE)."
-    );
-  }
-  const url = `${base}${path}`;
-  const headers = {
-    "Content-Type": "application/json",
-  };
-  if (authHeader) headers["Authorization"] = authHeader;
+// ---------- helpers: fetch with timeout + retry ----------
+const DEFAULT_TIMEOUT_MS = 15000;
+const RETRY_STATUS = new Set([429, 502, 503, 504]);
 
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function erp(
+  path,
+  {
+    method = "GET",
+    body,
+    query = {},
+    headers = {},
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    maxRetries = 2,
+  } = {}
+) {
+  const url = new URL(`${ERP_BASE}${path}`);
+  Object.entries(query || {}).forEach(([k, v]) => {
+    if (v === undefined || v === null) return;
+    if (Array.isArray(v))
+      v.forEach((vv) => url.searchParams.append(k, `${vv}`));
+    else url.searchParams.set(k, `${v}`);
   });
-  const text = await res.text();
 
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
+  let attempt = 0;
+  let lastErr;
 
-  if (!res.ok) {
-    const err = {
-      status: res.status,
-      data,
-    };
-    console.error("ERP error:", JSON.stringify(err, null, 2));
-    throw err;
+  while (attempt <= maxRetries) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    console.log("erp url", url.toString());
+    console.log("erp body", body);
+    try {
+      const res = await fetch(url.toString(), {
+        method,
+        headers: {
+          Authorization: `Bearer ${ERP_API_KEY}`,
+          "Content-Type": "application/json",
+          ...headers,
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      console.log("erp response status", res.status);
+
+      const text = await res.text();
+      let data;
+      try {
+        console.log("text", JSON.parse(text));
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        console.log("failed to parse json");
+        data = { raw: text };
+      }
+
+      if (!res.ok) {
+        console.log("Erp not ok");
+        // Rate limit/backoff
+        if (RETRY_STATUS.has(res.status) && attempt < maxRetries) {
+          const retryAfter =
+            Number(res.headers.get("retry-after")) ||
+            (500 * Math.pow(2, attempt)) / 1; // ms
+          await sleep(retryAfter);
+          attempt++;
+          continue;
+        }
+        const err = new Error(
+          `ERP ${method} ${url.pathname} failed: ${res.status}`
+        );
+        err.status = res.status;
+        err.data = data;
+        throw err;
+      }
+      console.log("erp is ok");
+      return data ?? {};
+    } catch (e) {
+      console.log("erp catch error", e);
+      clearTimeout(timeout);
+      lastErr =
+        e.name === "AbortError"
+          ? new Error(`ERP request timed out after ${timeoutMs}ms`)
+          : e;
+      if (attempt < maxRetries) {
+        const backoff = 300 * Math.pow(2, attempt);
+        await sleep(backoff);
+        attempt++;
+        continue;
+      }
+      throw lastErr;
+    }
   }
-  return data;
+  throw lastErr || new Error("Unknown ERP error");
 }
 
-// ---------- tool catalog
-function toolCatalog() {
-  const tools = [
-    // NEW: Project node search tool (GET)
-    {
-      name: "searchProjectNode",
-      description:
-        "GET /api/v1/projects/nodes/search/searchNodesArray?keywords=<term>&page=0&size=50&sort=insertDate,ASC&includePaths=true&includeStakeholders=true → returns normalized rows plus raw",
-      inputSchema: {
-        type: "object",
-        properties: {
-          keywords: {
-            type: "string",
-            description: "Search term for node name (e.g., LC4)",
-          },
-          page: { type: "integer", minimum: 0, default: 0 },
-          size: { type: "integer", minimum: 1, default: 50 },
-          sort: { type: "string", default: "insertDate,ASC" },
-          includePaths: { type: "boolean", default: true },
-          includeStakeholders: { type: "boolean", default: true },
-        },
-        required: ["keywords"],
-        additionalProperties: false,
-      },
+// ---------- utility: parse breadcrumb from treePath JSON ----------
+function parseBreadcrumb(treePath) {
+  try {
+    if (!treePath) {
+      return { array: [], text: "" };
+    }
+
+    const arr = JSON.parse(treePath);
+
+    if (!Array.isArray(arr)) {
+      console.warn("treePath is not an array:", treePath);
+      return { array: [], text: "" };
+    }
+
+    const names = arr.map((n) => n?.nodeName).filter(Boolean);
+
+    return {
+      array: names,
+      text: names.join(" › "),
+    };
+  } catch (error) {
+    console.error("Error parsing breadcrumb:", error.message);
+    return { array: [], text: "" };
+  }
+}
+
+// ---------- Ajv validation setup ----------
+const ajv = new Ajv({
+  allErrors: true,
+  removeAdditional: "failing",
+  coerceTypes: true,
+});
+addFormats(ajv);
+
+function compile(schema) {
+  const v = ajv.compile(schema);
+  return (data) => {
+    const ok = v(data);
+    if (!ok) {
+      const err = new Error("Validation failed");
+      err.validation = v.errors;
+      throw err;
+    }
+    return data;
+  };
+}
+
+// ---------- tool schemas ----------
+const STATUS_ENUM = [
+  "Not Started",
+  "In Progress",
+  "Blocked",
+  "Completed",
+  "On Hold",
+];
+
+const schemaSearchProjectNodes = {
+  type: "object",
+  properties: {
+    keywords: {
+      anyOf: [
+        { type: "string", minLength: 1 },
+        { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+      ],
     },
-    // Existing tools
+    page: { type: "integer", minimum: 0, default: 0 },
+    size: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+    sort: { type: "string", default: "insertDate,ASC" },
+    includePaths: { type: "boolean", default: true },
+    includeStakeholders: { type: "boolean", default: true },
+  },
+  required: ["keywords"],
+  additionalProperties: false,
+};
+
+const schemaUpdateNodeStatus = {
+  type: "object",
+  properties: {
+    nodeId: { type: "string", minLength: 1 },
+    status: { type: "string", enum: STATUS_ENUM },
+  },
+  required: ["nodeId", "status"],
+  additionalProperties: false,
+};
+
+const schemaUpdateNode = {
+  type: "object",
+  properties: {
+    nodeId: { type: "string", minLength: 1 },
+    status: { type: "string", enum: STATUS_ENUM },
+    nodeDescription: { type: "string" },
+    parentNodeId: { type: "string" },
+  },
+  required: ["nodeId"],
+  additionalProperties: false,
+};
+
+const validateSearchProjectNodes = compile(schemaSearchProjectNodes);
+const validateUpdateNodeStatus = compile(schemaUpdateNodeStatus);
+const validateUpdateNode = compile(schemaUpdateNode);
+
+// ---------- tool catalog ----------
+function toolCatalog() {
+  return [
+    // ---- NEW TOOLS FOR YOUR NEW AGENT ----
+    {
+      name: "searchProjectNodes",
+      description:
+        "GET /api/v1/projects/nodes/search/searchNodesArray → find project nodes by keywords; returns normalized items with breadcrumb.",
+      inputSchema: schemaSearchProjectNodes,
+    },
+    {
+      name: "updateNodeStatus",
+      description:
+        "PUT /api/v1/projects/nodes/{nodeId}/status → update only the status.",
+      inputSchema: schemaUpdateNodeStatus,
+    },
+    {
+      name: "updateNode",
+      description:
+        "PUT /api/v1/projects/nodes/{nodeId} → update status and/or nodeDescription (and parentNodeId only if explicitly requested).",
+      inputSchema: schemaUpdateNode,
+    },
+
+    // ---- (OPTIONAL) keep your existing indent tools so the server can serve multiple agents ----
     {
       name: "generateIndentNumber",
       description:
@@ -167,23 +329,23 @@ function toolCatalog() {
           indentTitle: { type: "string" },
           indentDescription: { type: "string" },
           indentType: { type: "string" },
-          priority: { type: "string" },
           projectNodeId: { type: "string" },
           locationId: { type: "string" },
           requestedById: { type: "string" },
-          requestorDepartment: { type: "string" },
           requestedDate: { type: "string" },
           requiredByDate: { type: "string" },
+          priority: { type: "string" },
+          isUrgent: { type: "boolean" },
           purposeOfIndent: { type: "string" },
-          workDescription: { type: "string" },
           justification: { type: "string" },
           estimatedBudget: { type: "number" },
           budgetCode: { type: "string" },
-          requiresApproval: { type: "boolean" },
-          isUrgent: { type: "boolean" },
-          deliveryInstructions: { type: "string" },
-          qualityRequirements: { type: "string" },
           indentNotes: { type: "string" },
+          workDescription: { type: "string" },
+          qualityRequirements: { type: "string" },
+          deliveryInstructions: { type: "string" },
+          requiresApproval: { type: "boolean" },
+          requestorDepartment: { type: "string" },
           indentItems: {
             type: "array",
             items: {
@@ -223,35 +385,221 @@ function toolCatalog() {
       },
     },
   ];
-  return tools;
 }
 
-// ---------- helpers for searchProjectNode normalization
-function safeParseTreePath(treePath) {
-  if (!treePath || typeof treePath !== "string") return [];
-  try {
-    const arr = JSON.parse(treePath);
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
+// ---------- core tool execution ----------
+async function handleToolCall(name, args) {
+  // Validation per tool
+  switch (name) {
+    case "searchProjectNodes": {
+      console.log("\n=== searchProjectNodes START ===");
+      console.log("Input args:", JSON.stringify(args, null, 2));
+
+      try {
+        // 1. Validate input
+        const a = validateSearchProjectNodes(args);
+        console.log("✓ Input validated");
+
+        // 2. Prepare query
+        const keywords =
+          typeof a.keywords === "string" ? a.keywords : a.keywords.join(" ");
+        const query = {
+          keywords,
+          page: a.page ?? 0,
+          size: a.size ?? 50,
+          sort: a.sort ?? "insertDate,ASC",
+          includePaths: a.includePaths ?? true,
+          includeStakeholders: a.includeStakeholders ?? true,
+        };
+        console.log("✓ Query prepared:", JSON.stringify(query));
+
+        // 3. Call ERP API
+        const raw = await erp(
+          "/api/v1/projects/nodes/search/searchNodesArray",
+          {
+            method: "GET",
+            query,
+          }
+        );
+        console.log("✓ ERP API call successful");
+        console.log("✓ Response status:", raw?.status);
+
+        // 4. Extract content
+        const content = raw?.data?.content ?? [];
+        console.log("✓ Content extracted, count:", content.length);
+
+        if (content.length > 0) {
+          console.log("✓ First item recCode:", content[0].recCode);
+          console.log("✓ First item nodeName:", content[0].nodeName);
+        }
+
+        // 5. Map items with safe breadcrumb parsing
+        const items = content.map((n, index) => {
+          try {
+            const bc = parseBreadcrumb(n.treePath);
+            const item = {
+              nodeId: n.recCode,
+              nodeName: n.nodeName,
+              status: n.status || null,
+              parentNodeId: n.parentNodeId || null,
+              nodeTypeId: n.nodeTypeId || null,
+              nodeTypeName: n.nodeTypeName || null,
+              breadcrumb: bc.array,
+              breadcrumbText: bc.text,
+              raw: n,
+            };
+            return item;
+          } catch (mapError) {
+            console.error(`❌ Error mapping item ${index}:`, mapError.message);
+            // Return item without breadcrumb if parsing fails
+            return {
+              nodeId: n.recCode,
+              nodeName: n.nodeName,
+              status: n.status || null,
+              parentNodeId: n.parentNodeId || null,
+              nodeTypeId: n.nodeTypeId || null,
+              nodeTypeName: n.nodeTypeName || null,
+              breadcrumb: [],
+              breadcrumbText: "",
+              raw: n,
+              _error: mapError.message,
+            };
+          }
+        });
+        console.log("✓ Items mapped, count:", items.length);
+
+        // 6. Prepare page info
+        const pageInfo = {
+          page: raw?.data?.pageable?.pageNumber ?? 0,
+          size: raw?.data?.pageable?.pageSize ?? items.length,
+          total: raw?.data?.totalElements ?? items.length,
+          totalPages: raw?.data?.totalPages ?? 1,
+        };
+        console.log("✓ Page info prepared:", JSON.stringify(pageInfo));
+
+        // 7. Create result
+        const result = { items, pageInfo };
+        console.log("✓ Result created");
+        console.log("✓ Result size (bytes):", JSON.stringify(result).length);
+        console.log("=== searchProjectNodes END (SUCCESS) ===\n");
+
+        return result;
+      } catch (error) {
+        console.error("=== searchProjectNodes END (ERROR) ===");
+        console.error("❌ Error details:", {
+          message: error.message,
+          status: error.status,
+          code: error.code,
+        });
+        throw error;
+      }
+    }
+
+    case "updateNodeStatus": {
+      console.log("\n=== updateNodeStatus START ===");
+      try {
+        const a = validateUpdateNodeStatus(args);
+        console.log("✓ Validated:", JSON.stringify(a));
+
+        const body = { status: a.status };
+        const raw = await erp(
+          `/api/v1/projects/nodes/${encodeURIComponent(a.nodeId)}/status`,
+          {
+            method: "PUT",
+            body,
+          }
+        );
+
+        const result = {
+          ok: true,
+          nodeId: a.nodeId,
+          status: a.status,
+          raw,
+        };
+
+        console.log("✓ Status updated successfully");
+        console.log("=== updateNodeStatus END (SUCCESS) ===\n");
+        return result;
+      } catch (error) {
+        console.error("=== updateNodeStatus END (ERROR) ===");
+        console.error("❌ Error:", error.message);
+        throw error;
+      }
+    }
+
+    case "updateNode": {
+      console.log("\n=== updateNode START ===");
+      try {
+        const a = validateUpdateNode(args);
+        console.log("✓ Validated:", JSON.stringify(a));
+
+        const body = {};
+        if (a.status !== undefined) body.status = a.status;
+        if (a.nodeDescription !== undefined)
+          body.nodeDescription = a.nodeDescription;
+        if (a.parentNodeId !== undefined) body.parentNodeId = a.parentNodeId;
+
+        if (Object.keys(body).length === 0) {
+          const err = new Error(
+            "Nothing to update: provide at least one of status, nodeDescription, parentNodeId"
+          );
+          err.code = "NO_FIELDS";
+          throw err;
+        }
+
+        console.log("✓ Update body:", JSON.stringify(body));
+
+        const raw = await erp(
+          `/api/v1/projects/nodes/${encodeURIComponent(a.nodeId)}`,
+          {
+            method: "PUT",
+            body,
+          }
+        );
+
+        const result = {
+          ok: true,
+          nodeId: a.nodeId,
+          ...body,
+          raw,
+        };
+
+        console.log("✓ Node updated successfully");
+        console.log("=== updateNode END (SUCCESS) ===\n");
+        return result;
+      } catch (error) {
+        console.error("=== updateNode END (ERROR) ===");
+        console.error("❌ Error:", error.message);
+        throw error;
+      }
+    }
+
+    // ---- existing indent tools passthroughs ----
+    case "generateIndentNumber":
+      return await erp("/api/v1/indents/generate-number", { method: "GET" });
+
+    case "fetchProjects":
+      return await erp("/api/v1/projects", { method: "GET" });
+
+    case "listLocations":
+      return await erp("/api/v1/locations", { method: "GET" });
+
+    case "listItems":
+      return await erp("/api/v1/items", { method: "GET" });
+
+    case "listUnits":
+      return await erp("/api/v1/units", { method: "GET" });
+
+    case "createIndent":
+      // no schema re-validation here; ERP will enforce
+      return await erp("/api/v1/indents", { method: "POST", body: args });
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
   }
 }
 
-function nodeToRow(node) {
-  const nodeId = node?.recCode || node?.id || node?.nodeId || "";
-  const nodeName = node?.nodeName || "(unnamed node)";
-  const status = node?.status || "";
-  const pathArr = safeParseTreePath(node?.treePath);
-  const breadcrumb = pathArr
-    .map((p) => p?.nodeName)
-    .filter(Boolean)
-    .join(" / ");
-  return { rowId: nodeId, nodeId, nodeName, breadcrumb, status };
-}
-
-// ---------- MCP JSON-RPC handlers
-
-// health
+// ---------- MCP JSON-RPC handlers ----------
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
@@ -259,29 +607,27 @@ app.get("/", (_req, res) => {
     mcp: {
       version: "1.0.0",
       name: "ERP MCP Adapter",
-      description: "MCP server for ERP indent & media management",
+      description: "MCP server for ERP node search & updates + indent tools",
     },
   });
 });
 
-// root JSON-RPC multiplexer - HANDLES OPENAI'S SPECIFIC FORMAT
 app.post("/", async (req, res) => {
   const { id, method, params } = req.body || {};
-
   try {
     if (method === "initialize") {
       const clientInfo = params?.clientInfo || {};
       const protocolVersion = params?.protocolVersion || "2025-06-18";
-
       console.log(
-        `Initialize request from: ${clientInfo.name}, protocol: ${protocolVersion}`
+        `Initialize from: ${
+          clientInfo.name || "unknown"
+        }, protocol: ${protocolVersion}`
       );
-
       return res.json({
         jsonrpc: "2.0",
         id,
         result: {
-          protocolVersion: protocolVersion,
+          protocolVersion,
           capabilities: { tools: {}, resources: {}, prompts: {} },
           serverInfo: { name: "erp-mcp-adapter", version: "1.0.0" },
         },
@@ -289,57 +635,55 @@ app.post("/", async (req, res) => {
     }
 
     if (method === "tools/list") {
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: { tools: toolCatalog() },
-      });
+      console.log("📋 Listing tools");
+      return res.json({ jsonrpc: "2.0", id, result: { tools: toolCatalog() } });
     }
 
     if (method === "tools/call") {
       const { name, arguments: args = {} } = params || {};
-      console.log(`Tool call: ${name}`, args);
+      console.log(`\n📞 Tool call: ${name}`);
 
-      const result = await handleToolCall(req, name, args);
+      try {
+        const data = await handleToolCall(name, args);
+        console.log(`✓ Tool ${name} executed successfully`);
+        console.log(`✓ Response size: ${JSON.stringify(data).length} bytes`);
 
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          content: [
-            {
-              type: "text",
-              text:
-                typeof result === "string"
-                  ? result
-                  : JSON.stringify(result, null, 2),
-            },
-          ],
-        },
-      });
+        const response = {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "json", data }],
+          },
+        };
+
+        console.log(`📤 Sending response for ${name}\n`);
+        return res.json(response);
+      } catch (toolError) {
+        console.error(`❌ Tool ${name} failed:`, toolError.message);
+        throw toolError;
+      }
     }
 
-    console.log(`Unknown method: ${method}`);
     return res.json({
       jsonrpc: "2.0",
       id,
       error: { code: -32601, message: `Method not found: ${method}` },
     });
   } catch (err) {
-    console.error("Error handling request:", err);
+    console.error("JSON-RPC error:", err);
     return res.json({
       jsonrpc: "2.0",
       id,
       error: {
         code: -32603,
-        message: "Internal error",
-        data: err?.message || err,
+        message: err?.message || "Internal error",
+        data: err?.validation || err?.data || null,
       },
     });
   }
 });
 
-// Explicit endpoints for other clients
+// ---------- explicit endpoints (handy for curl/debug) ----------
 app.post("/initialize", (req, res) => {
   const { id, params } = req.body || {};
   const protocolVersion = params?.protocolVersion || "2025-06-18";
@@ -356,34 +700,25 @@ app.post("/initialize", (req, res) => {
 
 app.post("/tools/list", (req, res) => {
   const id = req.body?.id ?? null;
-  res.json({
-    jsonrpc: "2.0",
-    id,
-    result: { tools: toolCatalog() },
-  });
+  res.json({ jsonrpc: "2.0", id, result: { tools: toolCatalog() } });
 });
 
 app.post("/tools/call", async (req, res) => {
   const id = req.body?.id ?? null;
   const { name, arguments: args = {} } = req.body?.params || {};
-
   try {
-    const result = await handleToolCall(req, name, args);
-    res.json({
+    console.log(`\n📞 Tool call (explicit endpoint): ${name}`);
+    const data = await handleToolCall(name, args);
+    console.log(`✓ Response size: ${JSON.stringify(data).length} bytes`);
+
+    const response = {
       jsonrpc: "2.0",
       id,
-      result: {
-        content: [
-          {
-            type: "text",
-            text:
-              typeof result === "string"
-                ? result
-                : JSON.stringify(result, null, 2),
-          },
-        ],
-      },
-    });
+      result: { content: [{ type: "json", data }] },
+    };
+
+    console.log(`📤 Sending response\n`);
+    res.json(response);
   } catch (err) {
     console.error("Tool call error:", err);
     res.json({
@@ -391,126 +726,23 @@ app.post("/tools/call", async (req, res) => {
       id,
       error: {
         code: -32603,
-        message: "Tool execution failed",
-        data: err?.message || err,
+        message: err?.message || "Tool execution failed",
+        data: err?.validation || err?.data || null,
       },
     });
   }
 });
 
-// OPTIONS for all endpoints
+// ---------- OPTIONS helpers ----------
 app.options("/initialize", (_req, res) => res.sendStatus(204));
 app.options("/tools/list", (_req, res) => res.sendStatus(204));
 app.options("/tools/call", (_req, res) => res.sendStatus(204));
-app.options("/mcp", (_req, res) => res.sendStatus(204));
 
-// GET endpoint for debugging
-app.get("/tools", (_req, res) => {
-  res.json({ tools: toolCatalog() });
-});
-
-// ---- actual tool execution
-async function handleToolCall(req, name, args) {
-  console.log(
-    `Executing tool: ${name} with args:`,
-    JSON.stringify(args, null, 2)
-  );
-
-  try {
-    switch (name) {
-      // NEW: searchProjectNode with defensive parsing & normalization
-      case "searchProjectNode": {
-        const keywords = String(args?.keywords || "").trim();
-        const page = Number.isInteger(args?.page) ? String(args.page) : "0";
-        const size = Number.isInteger(args?.size) ? String(args.size) : "50";
-        const sort = args?.sort || "insertDate,ASC";
-        const includePaths =
-          typeof args?.includePaths === "boolean"
-            ? String(args.includePaths)
-            : "true";
-        const includeStakeholders =
-          typeof args?.includeStakeholders === "boolean"
-            ? String(args.includeStakeholders)
-            : "true";
-
-        const qs = new URLSearchParams({
-          keywords,
-          page,
-          size,
-          sort,
-          includePaths,
-          includeStakeholders,
-        });
-
-        // Call ERP
-        const raw = await erp(
-          req,
-          `/api/v1/projects/nodes/search/searchNodesArray?${qs.toString()}`,
-          "GET"
-        );
-
-        const content = raw?.data?.content ?? [];
-        console.log(
-          "searchNodesArray content length:",
-          Array.isArray(content) ? content.length : "not array"
-        );
-
-        // Normalize rows for table.select
-        let rows = [];
-        if (Array.isArray(content)) {
-          try {
-            rows = content.map(nodeToRow).filter((r) => r.nodeId);
-          } catch (e) {
-            console.error("row transform error:", e);
-            rows = [];
-          }
-        }
-
-        return {
-          ok: true,
-          count: rows.length,
-          rows,
-          pageInfo: {
-            page: raw?.data?.pageable?.pageNumber ?? 0,
-            size: raw?.data?.pageable?.pageSize ?? Number(size),
-            totalElements: raw?.data?.totalElements ?? rows.length,
-            totalPages: raw?.data?.totalPages ?? 1,
-          },
-          // Keep raw if you want to debug on the agent side
-          // raw,
-        };
-      }
-
-      case "generateIndentNumber":
-        return await erp(req, "/api/v1/indents/generate-number", "GET");
-      case "fetchProjects":
-        return await erp(req, "/api/v1/projects", "GET");
-      case "listLocations":
-        return await erp(req, "/api/v1/locations", "GET");
-      case "listItems":
-        return await erp(req, "/api/v1/items", "GET");
-      case "listUnits":
-        return await erp(req, "/api/v1/units", "GET");
-      case "createIndent":
-        return await erp(req, "/api/v1/indents", "POST", args);
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
-    }
-  } catch (error) {
-    console.error(`Tool execution error for ${name}:`, error);
-    // normalize thrown error so Agent gets a clean message
-    if (error?.data?.message) throw new Error(error.data.message);
-    if (typeof error?.data === "string") throw new Error(error.data);
-    if (typeof error?.message === "string") throw new Error(error.message);
-    throw error;
-  }
-}
-
+// ---------- start ----------
 app.listen(PORT, () => {
-  console.log(`MCP adapter listening on :${PORT}`);
-  console.log(
-    `ENV ERP_BASE=${ENV_ERP_BASE || "(not set; using header X-ERP-Base-Url)"}`
-  );
-  console.log(`Ready for OpenAI MCP connections`);
+  console.log(`\n${"=".repeat(60)}`);
+  console.log(`🚀 MCP adapter listening on :${PORT}`);
+  console.log(`🔗 ERP_BASE=${ERP_BASE}`);
+  console.log(`✅ Ready for OpenAI MCP connections`);
+  console.log(`${"=".repeat(60)}\n`);
 });
