@@ -82,7 +82,8 @@ async function erp(
   while (attempt <= maxRetries) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
+    console.log("erp url", url.toString());
+    console.log("erp body", body);
     try {
       const res = await fetch(url.toString(), {
         method,
@@ -95,9 +96,9 @@ async function erp(
         signal: controller.signal,
       });
       clearTimeout(timeout);
-      console.log("erp equery");
-      console.log(res);
-      console.log(res.text);
+      console.log("erp equery", res);
+      // console.log();
+      console.log("respex", res.text);
       const text = await res.text();
       let data;
       try {
