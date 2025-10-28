@@ -102,12 +102,15 @@ async function erp(
       const text = await res.text();
       let data;
       try {
+        console.log("text", JSON.parse(text));
         data = text ? JSON.parse(text) : null;
       } catch {
+        console.log("failed to parse json");
         data = { raw: text };
       }
 
       if (!res.ok) {
+        console.log("Erp not ok");
         // Rate limit/backoff
         if (RETRY_STATUS.has(res.status) && attempt < maxRetries) {
           const retryAfter =
@@ -124,8 +127,10 @@ async function erp(
         err.data = data;
         throw err;
       }
+      console.log("erp is ok", data);
       return data ?? {};
     } catch (e) {
+      console.log("erp catch error", e);
       clearTimeout(timeout);
       lastErr =
         e.name === "AbortError"
@@ -390,7 +395,9 @@ async function handleToolCall(name, args) {
         method: "GET",
         query,
       });
+      console.log("everything worked fine till here");
       const content = raw?.data?.content ?? [];
+      console.log("content", content);
       const items = content.map((n) => {
         const bc = parseBreadcrumb(n.treePath);
         return {
