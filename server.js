@@ -183,24 +183,24 @@ const STATUS_ENUM = [
   "On Hold",
 ];
 
-const schemaSearchProjectNodes = {
-  type: "object",
-  properties: {
-    keywords: {
-      anyOf: [
-        { type: "string", minLength: 1 },
-        { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
-      ],
-    },
-    page: { type: "integer", minimum: 0, default: 0 },
-    size: { type: "integer", minimum: 1, maximum: 200, default: 50 },
-    sort: { type: "string", default: "insertDate,ASC" },
-    includePaths: { type: "boolean", default: true },
-    includeStakeholders: { type: "boolean", default: true },
-  },
-  required: ["keywords"],
-  additionalProperties: false,
-};
+// const schemaSearchProjectNodes = {
+//   type: "object",
+//   properties: {
+//     keywords: {
+//       anyOf: [
+//         { type: "string", minLength: 1 },
+//         { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+//       ],
+//     },
+//     page: { type: "integer", minimum: 0, default: 0 },
+//     size: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+//     sort: { type: "string", default: "insertDate,ASC" },
+//     includePaths: { type: "boolean", default: true },
+//     includeStakeholders: { type: "boolean", default: true },
+//   },
+//   required: ["keywords"],
+//   additionalProperties: false,
+// };
 
 const schemaUpdateNodeStatus = {
   type: "object",
@@ -224,7 +224,7 @@ const schemaUpdateNode = {
   additionalProperties: false,
 };
 
-const validateSearchProjectNodes = compile(schemaSearchProjectNodes);
+// const validateSearchProjectNodes = compile(schemaSearchProjectNodes);
 const validateUpdateNodeStatus = compile(schemaUpdateNodeStatus);
 const validateUpdateNode = compile(schemaUpdateNode);
 
@@ -236,7 +236,7 @@ function toolCatalog() {
       name: "searchProjectNodes",
       description:
         "GET /api/v1/projects/nodes/search/searchNodesArray → find project nodes by keywords; returns normalized items with breadcrumb.",
-      inputSchema: schemaSearchProjectNodes,
+      // inputSchema: schemaSearchProjectNodes,
     },
     {
       name: "updateNodeStatus",
@@ -372,17 +372,17 @@ async function handleToolCall(name, args) {
   // Validation per tool
   switch (name) {
     case "searchProjectNodes": {
-      const a = validateSearchProjectNodes(args);
-      const keywords =
-        typeof a.keywords === "string" ? a.keywords : a.keywords.join(" ");
-      const query = {
-        keywords,
-        page: a.page ?? 0,
-        size: a.size ?? 50,
-        sort: a.sort ?? "insertDate,ASC",
-        includePaths: a.includePaths ?? true,
-        includeStakeholders: a.includeStakeholders ?? true,
-      };
+      // const a = validateSearchProjectNodes(args);
+      // const keywords =
+      //   typeof a.keywords === "string" ? a.keywords : a.keywords.join(" ");
+      // const query = {
+      //   keywords,
+      //   page: a.page ?? 0,
+      //   size: a.size ?? 50,
+      //   sort: a.sort ?? "insertDate,ASC",
+      //   includePaths: a.includePaths ?? true,
+      //   includeStakeholders: a.includeStakeholders ?? true,
+      // };
       const raw = await erp(
         "/api/v1/projects/nodes/search/searchNodesArray?keywords=lc4&page=0&size=50&sort=insertDate,ASC&includePaths=true&includeStakeholders=true",
         {
