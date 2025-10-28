@@ -1,265 +1,115 @@
-// mcp-server.js
 import express from "express";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
-import Ajv from "ajv";
-import addFormats from "ajv-formats";
-
 dotenv.config();
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ---------- basic logger (redacts auth) ----------
+// ---- basic request logger (remove after debugging)
 app.use((req, _res, next) => {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}] ${req.method} ${req.path}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   if (req.body && Object.keys(req.body).length > 0) {
-    // Avoid printing large payloads or secrets
-    const clone = JSON.parse(JSON.stringify(req.body));
-    if (clone?.params?.headers?.Authorization) {
-      clone.params.headers.Authorization = "REDACTED";
-    }
-    console.log("Body:", JSON.stringify(clone, null, 2));
+    console.log("Body:", JSON.stringify(req.body, null, 2));
   }
   next();
 });
 
-// ---------- CORS (adjust origin in prod) ----------
+// ---- CORS (Agent Builder runs at https://platform.openai.com)
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // tighten in production
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type,Authorization,X-ERP-Base-Url"
+  );
   res.setHeader("Access-Control-Max-Age", "600");
   res.setHeader("Cache-Control", "no-store");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// ---------- config ----------
 const PORT = process.env.PORT || 4000;
-const ERP_BASE = (process.env.ERP_BASE || "").replace(/\/$/, "");
-const ERP_API_KEY = process.env.ERP_API_KEY;
-if (!ERP_BASE) {
-  console.error("Missing ERP_BASE");
-  process.exit(1);
-}
-if (!ERP_API_KEY) {
-  console.error("Missing ERP_API_KEY");
-  process.exit(1);
-}
+const ENV_ERP_BASE = (process.env.ERP_BASE || "").replace(/\/$/, "");
+const ENV_ERP_TOKEN = process.env.ERP_TOKEN || "";
 
-// ---------- helpers: fetch with timeout + retry ----------
-const DEFAULT_TIMEOUT_MS = 15000;
-const RETRY_STATUS = new Set([429, 502, 503, 504]);
-
-async function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+/**
+ * Resolve ERP base URL and headers from the current request.
+ * Allows Agent SDK to pass Authorization & X-ERP-Base-Url dynamically.
+ */
+function resolveErpContext(req) {
+  const headerBase = (req.get("X-ERP-Base-Url") || "").replace(/\/$/, "");
+  const base = headerBase || ENV_ERP_BASE;
+  const authHeader =
+    req.get("Authorization") ||
+    (ENV_ERP_TOKEN ? `Bearer ${ENV_ERP_TOKEN}` : "");
+  return { base, authHeader };
 }
 
-async function erp(
-  path,
-  {
-    method = "GET",
-    body,
-    query = {},
-    headers = {},
-    timeoutMs = DEFAULT_TIMEOUT_MS,
-    maxRetries = 2,
-  } = {}
-) {
-  const url = new URL(`${ERP_BASE}${path}`);
-  Object.entries(query || {}).forEach(([k, v]) => {
-    if (v === undefined || v === null) return;
-    if (Array.isArray(v))
-      v.forEach((vv) => url.searchParams.append(k, `${vv}`));
-    else url.searchParams.set(k, `${v}`);
-  });
-
-  let attempt = 0;
-  let lastErr;
-
-  while (attempt <= maxRetries) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    console.log("erp url", url.toString());
-    console.log("erp body", body);
-    try {
-      const res = await fetch(url.toString(), {
-        method,
-        headers: {
-          Authorization: `Bearer ${ERP_API_KEY}`,
-          "Content-Type": "application/json",
-          ...headers,
-        },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-      console.log("erp equerys", res);
-      // console.log();
-      console.log("respex", res.text);
-      const text = await res.text();
-      let data;
-      try {
-        console.log("text", JSON.parse(text));
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        console.log("failed to parse json");
-        data = { raw: text };
-      }
-
-      if (!res.ok) {
-        console.log("Erp not ok");
-        // Rate limit/backoff
-        if (RETRY_STATUS.has(res.status) && attempt < maxRetries) {
-          const retryAfter =
-            Number(res.headers.get("retry-after")) ||
-            (500 * Math.pow(2, attempt)) / 1; // ms
-          await sleep(retryAfter);
-          attempt++;
-          continue;
-        }
-        const err = new Error(
-          `ERP ${method} ${url.pathname} failed: ${res.status}`
-        );
-        err.status = res.status;
-        err.data = data;
-        throw err;
-      }
-      console.log("erp is ok", data);
-      return data ?? {};
-    } catch (e) {
-      console.log("erp catch error", e);
-      clearTimeout(timeout);
-      lastErr =
-        e.name === "AbortError"
-          ? new Error(`ERP request timed out after ${timeoutMs}ms`)
-          : e;
-      if (attempt < maxRetries) {
-        const backoff = 300 * Math.pow(2, attempt);
-        await sleep(backoff);
-        attempt++;
-        continue;
-      }
-      throw lastErr;
-    }
+async function erp(req, path, method = "GET", body) {
+  const { base, authHeader } = resolveErpContext(req);
+  if (!base) {
+    throw new Error(
+      "ERP_BASE is not configured (missing X-ERP-Base-Url header or ENV ERP_BASE)."
+    );
   }
-  throw lastErr || new Error("Unknown ERP error");
-}
-
-// ---------- utility: parse breadcrumb from treePath JSON ----------
-function parseBreadcrumb(treePath) {
-  try {
-    const arr = JSON.parse(treePath || "[]");
-    const names = Array.isArray(arr)
-      ? arr.map((n) => n.nodeName).filter(Boolean)
-      : [];
-    return { array: names, text: names.join(" › ") };
-  } catch {
-    return { array: [], text: "" };
-  }
-}
-
-// ---------- Ajv validation setup ----------
-const ajv = new Ajv({
-  allErrors: true,
-  removeAdditional: "failing",
-  coerceTypes: true,
-});
-addFormats(ajv);
-
-function compile(schema) {
-  const v = ajv.compile(schema);
-  return (data) => {
-    const ok = v(data);
-    if (!ok) {
-      const err = new Error("Validation failed");
-      err.validation = v.errors;
-      throw err;
-    }
-    return data;
+  const url = `${base}${path}`;
+  const headers = {
+    "Content-Type": "application/json",
   };
+  if (authHeader) headers["Authorization"] = authHeader;
+
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    const err = {
+      status: res.status,
+      data,
+    };
+    console.error("ERP error:", JSON.stringify(err, null, 2));
+    throw err;
+  }
+  return data;
 }
 
-// ---------- tool schemas ----------
-const STATUS_ENUM = [
-  "Not Started",
-  "In Progress",
-  "Blocked",
-  "Completed",
-  "On Hold",
-];
-
-const schemaSearchProjectNodes = {
-  type: "object",
-  properties: {
-    keywords: {
-      anyOf: [
-        { type: "string", minLength: 1 },
-        { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
-      ],
-    },
-    page: { type: "integer", minimum: 0, default: 0 },
-    size: { type: "integer", minimum: 1, maximum: 200, default: 50 },
-    sort: { type: "string", default: "insertDate,ASC" },
-    includePaths: { type: "boolean", default: true },
-    includeStakeholders: { type: "boolean", default: true },
-  },
-  required: ["keywords"],
-  additionalProperties: false,
-};
-
-const schemaUpdateNodeStatus = {
-  type: "object",
-  properties: {
-    nodeId: { type: "string", minLength: 1 },
-    status: { type: "string", enum: STATUS_ENUM },
-  },
-  required: ["nodeId", "status"],
-  additionalProperties: false,
-};
-
-const schemaUpdateNode = {
-  type: "object",
-  properties: {
-    nodeId: { type: "string", minLength: 1 },
-    status: { type: "string", enum: STATUS_ENUM },
-    nodeDescription: { type: "string" },
-    parentNodeId: { type: "string" },
-  },
-  required: ["nodeId"],
-  additionalProperties: false,
-};
-
-const validateSearchProjectNodes = compile(schemaSearchProjectNodes);
-const validateUpdateNodeStatus = compile(schemaUpdateNodeStatus);
-const validateUpdateNode = compile(schemaUpdateNode);
-
-// ---------- tool catalog ----------
+// ---------- tool catalog
 function toolCatalog() {
-  return [
-    // ---- NEW TOOLS FOR YOUR NEW AGENT ----
+  const tools = [
+    // NEW: Project node search tool (GET)
     {
-      name: "searchProjectNodes",
+      name: "searchProjectNode",
       description:
-        "GET /api/v1/projects/nodes/search/searchNodesArray → find project nodes by keywords; returns normalized items with breadcrumb.",
-      inputSchema: schemaSearchProjectNodes,
+        "GET /api/v1/projects/nodes/search/searchNodesArray?keywords=<term>&page=0&size=50&sort=insertDate,ASC&includePaths=true&includeStakeholders=true → returns normalized rows plus raw",
+      inputSchema: {
+        type: "object",
+        properties: {
+          keywords: {
+            type: "string",
+            description: "Search term for node name (e.g., LC4)",
+          },
+          page: { type: "integer", minimum: 0, default: 0 },
+          size: { type: "integer", minimum: 1, default: 50 },
+          sort: { type: "string", default: "insertDate,ASC" },
+          includePaths: { type: "boolean", default: true },
+          includeStakeholders: { type: "boolean", default: true },
+        },
+        required: ["keywords"],
+        additionalProperties: false,
+      },
     },
-    {
-      name: "updateNodeStatus",
-      description:
-        "PUT /api/v1/projects/nodes/{nodeId}/status → update only the status.",
-      inputSchema: schemaUpdateNodeStatus,
-    },
-    {
-      name: "updateNode",
-      description:
-        "PUT /api/v1/projects/nodes/{nodeId} → update status and/or nodeDescription (and parentNodeId only if explicitly requested).",
-      inputSchema: schemaUpdateNode,
-    },
-
-    // ---- (OPTIONAL) keep your existing indent tools so the server can serve multiple agents ----
+    // Existing tools
     {
       name: "generateIndentNumber",
       description:
@@ -373,125 +223,35 @@ function toolCatalog() {
       },
     },
   ];
+  return tools;
 }
 
-// ---------- core tool execution ----------
-async function handleToolCall(name, args) {
-  // Validation per tool
-  switch (name) {
-    case "searchProjectNodes": {
-      const a = validateSearchProjectNodes(args);
-      const keywords =
-        typeof a.keywords === "string" ? a.keywords : a.keywords.join(" ");
-      const query = {
-        keywords,
-        page: a.page ?? 0,
-        size: a.size ?? 50,
-        sort: a.sort ?? "insertDate,ASC",
-        includePaths: a.includePaths ?? true,
-        includeStakeholders: a.includeStakeholders ?? true,
-      };
-      const raw = await erp("/api/v1/projects/nodes/search/searchNodesArray", {
-        method: "GET",
-        query,
-      });
-      console.log("everything worked fine till here");
-      const content = raw?.data?.content ?? [];
-      console.log("content", content);
-      const items = content.map((n) => {
-        const bc = parseBreadcrumb(n.treePath);
-        return {
-          nodeId: n.recCode,
-          nodeName: n.nodeName,
-          status: n.status || null,
-          parentNodeId: n.parentNodeId || null,
-          breadcrumb: bc.array,
-          breadcrumbText: bc.text,
-          raw: n, // keep raw for the agent if needed
-        };
-      });
-      const pageInfo = {
-        page: raw?.data?.pageable?.pageNumber ?? 0,
-        size: raw?.data?.pageable?.pageSize ?? items.length,
-        total: raw?.data?.totalElements ?? items.length,
-        totalPages: raw?.data?.totalPages ?? 1,
-      };
-      return { items, pageInfo };
-    }
-
-    case "updateNodeStatus": {
-      const a = validateUpdateNodeStatus(args);
-      const body = { status: a.status };
-      const raw = await erp(
-        `/api/v1/projects/nodes/${encodeURIComponent(a.nodeId)}/status`,
-        {
-          method: "PUT",
-          body,
-        }
-      );
-      return {
-        ok: true,
-        nodeId: a.nodeId,
-        status: a.status,
-        raw,
-      };
-    }
-
-    case "updateNode": {
-      const a = validateUpdateNode(args);
-      const body = {};
-      if (a.status !== undefined) body.status = a.status;
-      if (a.nodeDescription !== undefined)
-        body.nodeDescription = a.nodeDescription;
-      if (a.parentNodeId !== undefined) body.parentNodeId = a.parentNodeId; // only if explicitly provided
-      if (Object.keys(body).length === 0) {
-        const err = new Error(
-          "Nothing to update: provide at least one of status, nodeDescription, parentNodeId"
-        );
-        err.code = "NO_FIELDS";
-        throw err;
-      }
-      const raw = await erp(
-        `/api/v1/projects/nodes/${encodeURIComponent(a.nodeId)}`,
-        {
-          method: "PUT",
-          body,
-        }
-      );
-      return {
-        ok: true,
-        nodeId: a.nodeId,
-        ...body,
-        raw,
-      };
-    }
-
-    // ---- existing indent tools passthroughs ----
-    case "generateIndentNumber":
-      return await erp("/api/v1/indents/generate-number", { method: "GET" });
-
-    case "fetchProjects":
-      return await erp("/api/v1/projects", { method: "GET" });
-
-    case "listLocations":
-      return await erp("/api/v1/locations", { method: "GET" });
-
-    case "listItems":
-      return await erp("/api/v1/items", { method: "GET" });
-
-    case "listUnits":
-      return await erp("/api/v1/units", { method: "GET" });
-
-    case "createIndent":
-      // no schema re-validation here; ERP will enforce
-      return await erp("/api/v1/indents", { method: "POST", body: args });
-
-    default:
-      throw new Error(`Unknown tool: ${name}`);
+// ---------- helpers for searchProjectNode normalization
+function safeParseTreePath(treePath) {
+  if (!treePath || typeof treePath !== "string") return [];
+  try {
+    const arr = JSON.parse(treePath);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
   }
 }
 
-// ---------- MCP JSON-RPC handlers ----------
+function nodeToRow(node) {
+  const nodeId = node?.recCode || node?.id || node?.nodeId || "";
+  const nodeName = node?.nodeName || "(unnamed node)";
+  const status = node?.status || "";
+  const pathArr = safeParseTreePath(node?.treePath);
+  const breadcrumb = pathArr
+    .map((p) => p?.nodeName)
+    .filter(Boolean)
+    .join(" / ");
+  return { rowId: nodeId, nodeId, nodeName, breadcrumb, status };
+}
+
+// ---------- MCP JSON-RPC handlers
+
+// health
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
@@ -499,27 +259,29 @@ app.get("/", (_req, res) => {
     mcp: {
       version: "1.0.0",
       name: "ERP MCP Adapter",
-      description: "MCP server for ERP node search & updates + indent tools",
+      description: "MCP server for ERP indent & media management",
     },
   });
 });
 
+// root JSON-RPC multiplexer - HANDLES OPENAI'S SPECIFIC FORMAT
 app.post("/", async (req, res) => {
   const { id, method, params } = req.body || {};
+
   try {
     if (method === "initialize") {
       const clientInfo = params?.clientInfo || {};
       const protocolVersion = params?.protocolVersion || "2025-06-18";
+
       console.log(
-        `Initialize from: ${
-          clientInfo.name || "unknown"
-        }, protocol: ${protocolVersion}`
+        `Initialize request from: ${clientInfo.name}, protocol: ${protocolVersion}`
       );
+
       return res.json({
         jsonrpc: "2.0",
         id,
         result: {
-          protocolVersion,
+          protocolVersion: protocolVersion,
           capabilities: { tools: {}, resources: {}, prompts: {} },
           serverInfo: { name: "erp-mcp-adapter", version: "1.0.0" },
         },
@@ -527,42 +289,57 @@ app.post("/", async (req, res) => {
     }
 
     if (method === "tools/list") {
-      return res.json({ jsonrpc: "2.0", id, result: { tools: toolCatalog() } });
+      return res.json({
+        jsonrpc: "2.0",
+        id,
+        result: { tools: toolCatalog() },
+      });
     }
 
     if (method === "tools/call") {
       const { name, arguments: args = {} } = params || {};
-      const data = await handleToolCall(name, args);
-      // IMPORTANT: return structured JSON, not text
+      console.log(`Tool call: ${name}`, args);
+
+      const result = await handleToolCall(req, name, args);
+
       return res.json({
         jsonrpc: "2.0",
         id,
         result: {
-          content: [{ type: "json", data }],
+          content: [
+            {
+              type: "text",
+              text:
+                typeof result === "string"
+                  ? result
+                  : JSON.stringify(result, null, 2),
+            },
+          ],
         },
       });
     }
 
+    console.log(`Unknown method: ${method}`);
     return res.json({
       jsonrpc: "2.0",
       id,
       error: { code: -32601, message: `Method not found: ${method}` },
     });
   } catch (err) {
-    console.error("JSON-RPC error:", err);
+    console.error("Error handling request:", err);
     return res.json({
       jsonrpc: "2.0",
       id,
       error: {
         code: -32603,
-        message: err?.message || "Internal error",
-        data: err?.validation || err?.data || null,
+        message: "Internal error",
+        data: err?.message || err,
       },
     });
   }
 });
 
-// ---------- explicit endpoints (handy for curl/debug) ----------
+// Explicit endpoints for other clients
 app.post("/initialize", (req, res) => {
   const { id, params } = req.body || {};
   const protocolVersion = params?.protocolVersion || "2025-06-18";
@@ -579,18 +356,33 @@ app.post("/initialize", (req, res) => {
 
 app.post("/tools/list", (req, res) => {
   const id = req.body?.id ?? null;
-  res.json({ jsonrpc: "2.0", id, result: { tools: toolCatalog() } });
+  res.json({
+    jsonrpc: "2.0",
+    id,
+    result: { tools: toolCatalog() },
+  });
 });
 
 app.post("/tools/call", async (req, res) => {
   const id = req.body?.id ?? null;
   const { name, arguments: args = {} } = req.body?.params || {};
+
   try {
-    const data = await handleToolCall(name, args);
+    const result = await handleToolCall(req, name, args);
     res.json({
       jsonrpc: "2.0",
       id,
-      result: { content: [{ type: "json", data }] },
+      result: {
+        content: [
+          {
+            type: "text",
+            text:
+              typeof result === "string"
+                ? result
+                : JSON.stringify(result, null, 2),
+          },
+        ],
+      },
     });
   } catch (err) {
     console.error("Tool call error:", err);
@@ -599,21 +391,126 @@ app.post("/tools/call", async (req, res) => {
       id,
       error: {
         code: -32603,
-        message: err?.message || "Tool execution failed",
-        data: err?.validation || err?.data || null,
+        message: "Tool execution failed",
+        data: err?.message || err,
       },
     });
   }
 });
 
-// ---------- OPTIONS helpers ----------
+// OPTIONS for all endpoints
 app.options("/initialize", (_req, res) => res.sendStatus(204));
 app.options("/tools/list", (_req, res) => res.sendStatus(204));
 app.options("/tools/call", (_req, res) => res.sendStatus(204));
+app.options("/mcp", (_req, res) => res.sendStatus(204));
 
-// ---------- start ----------
+// GET endpoint for debugging
+app.get("/tools", (_req, res) => {
+  res.json({ tools: toolCatalog() });
+});
+
+// ---- actual tool execution
+async function handleToolCall(req, name, args) {
+  console.log(
+    `Executing tool: ${name} with args:`,
+    JSON.stringify(args, null, 2)
+  );
+
+  try {
+    switch (name) {
+      // NEW: searchProjectNode with defensive parsing & normalization
+      case "searchProjectNode": {
+        const keywords = String(args?.keywords || "").trim();
+        const page = Number.isInteger(args?.page) ? String(args.page) : "0";
+        const size = Number.isInteger(args?.size) ? String(args.size) : "50";
+        const sort = args?.sort || "insertDate,ASC";
+        const includePaths =
+          typeof args?.includePaths === "boolean"
+            ? String(args.includePaths)
+            : "true";
+        const includeStakeholders =
+          typeof args?.includeStakeholders === "boolean"
+            ? String(args.includeStakeholders)
+            : "true";
+
+        const qs = new URLSearchParams({
+          keywords,
+          page,
+          size,
+          sort,
+          includePaths,
+          includeStakeholders,
+        });
+
+        // Call ERP
+        const raw = await erp(
+          req,
+          `/api/v1/projects/nodes/search/searchNodesArray?${qs.toString()}`,
+          "GET"
+        );
+
+        const content = raw?.data?.content ?? [];
+        console.log(
+          "searchNodesArray content length:",
+          Array.isArray(content) ? content.length : "not array"
+        );
+
+        // Normalize rows for table.select
+        let rows = [];
+        if (Array.isArray(content)) {
+          try {
+            rows = content.map(nodeToRow).filter((r) => r.nodeId);
+          } catch (e) {
+            console.error("row transform error:", e);
+            rows = [];
+          }
+        }
+
+        return {
+          ok: true,
+          count: rows.length,
+          rows,
+          pageInfo: {
+            page: raw?.data?.pageable?.pageNumber ?? 0,
+            size: raw?.data?.pageable?.pageSize ?? Number(size),
+            totalElements: raw?.data?.totalElements ?? rows.length,
+            totalPages: raw?.data?.totalPages ?? 1,
+          },
+          // Keep raw if you want to debug on the agent side
+          // raw,
+        };
+      }
+
+      case "generateIndentNumber":
+        return await erp(req, "/api/v1/indents/generate-number", "GET");
+      case "fetchProjects":
+        return await erp(req, "/api/v1/projects", "GET");
+      case "listLocations":
+        return await erp(req, "/api/v1/locations", "GET");
+      case "listItems":
+        return await erp(req, "/api/v1/items", "GET");
+      case "listUnits":
+        return await erp(req, "/api/v1/units", "GET");
+      case "createIndent":
+        return await erp(req, "/api/v1/indents", "POST", args);
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  } catch (error) {
+    console.error(`Tool execution error for ${name}:`, error);
+    // normalize thrown error so Agent gets a clean message
+    if (error?.data?.message) throw new Error(error.data.message);
+    if (typeof error?.data === "string") throw new Error(error.data);
+    if (typeof error?.message === "string") throw new Error(error.message);
+    throw error;
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`MCP adapter listening on :${PORT}`);
-  console.log(`ERP_BASE=${ERP_BASE}`);
-  console.log("Ready for OpenAI MCP connections");
+  console.log(
+    `ENV ERP_BASE=${ENV_ERP_BASE || "(not set; using header X-ERP-Base-Url)"}`
+  );
+  console.log(`Ready for OpenAI MCP connections`);
 });
