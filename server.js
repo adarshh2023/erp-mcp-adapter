@@ -384,7 +384,7 @@ async function handleToolCall(name, args) {
         includeStakeholders: a.includeStakeholders ?? true,
       };
       const raw = await erp(
-        "api/v1/projects/nodes/search/searchNodesArray?keywords=lc4&page=0&size=50&sort=insertDate,ASC&includePaths=true&includeStakeholders=true",
+        "/api/v1/projects/nodes/search/searchNodesArray?keywords=lc4&page=0&size=50&sort=insertDate,ASC&includePaths=true&includeStakeholders=true",
         {
           method: "GET",
         }
