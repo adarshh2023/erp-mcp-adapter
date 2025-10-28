@@ -95,7 +95,9 @@ async function erp(
         signal: controller.signal,
       });
       clearTimeout(timeout);
-
+      console.log("erp equery");
+      console.log(res);
+      console.log(res.text);
       const text = await res.text();
       let data;
       try {
