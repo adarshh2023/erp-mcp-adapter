@@ -383,10 +383,12 @@ async function handleToolCall(name, args) {
         includePaths: a.includePaths ?? true,
         includeStakeholders: a.includeStakeholders ?? true,
       };
-      const raw = await erp("/api/v1/projects/nodes/search/searchNodesArray", {
-        method: "GET",
-        query,
-      });
+      const raw = await erp(
+        "api/v1/projects/nodes/search/searchNodesArray?keywords=lc4&page=0&size=50&sort=insertDate,ASC&includePaths=true&includeStakeholders=true",
+        {
+          method: "GET",
+        }
+      );
       const content = raw?.data?.content ?? [];
       const items = content.map((n) => {
         const bc = parseBreadcrumb(n.treePath);
