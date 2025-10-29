@@ -1,46 +1,38 @@
-// server.js — Minimal MCP-style server for Jet Realty search + node updates (no file upload handled here)
-// Usage
-//   PORT=3010 BASE_URL=https://jetrealty.gorealla.ai API_TOKEN=<<optional if needed>> node server.js
-//
-// Endpoints exposed to Agent Builder as an MCP server:
-//   POST /tools  → describes available tools
-//   POST /call   → executes a tool by name with args { toolName, arguments }
-//
-// This server DOES NOT accept or proxy image binaries. Upload files directly from the frontend to
-//   POST  /api/v1/gallery/upload
-// and then pass resulting fields (e.g., nodeId, parentNodeId if provided) back to the agent to continue.
-
 import express from "express";
-import cors from "cors";
-import axios from "axios";
+import fetch from "node-fetch";
+import dotenv from "dotenv";
+dotenv.config();
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 3010;
-const BASE_URL = process.env.BASE_URL || "https://gorealla.heptanesia.com"; // no trailing slash
-const API_TOKEN = process.env.API_TOKEN || ""; // if your API requires Bearer; else leave blank
-
-const http = axios.create({
-  baseURL: BASE_URL,
-  timeout: 30_000,
-  headers: API_TOKEN
-    ? {
-        Authorization: `Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MTcyNzQzOCwiZXhwIjoxNzYxODEzODM4fQ.kqg71O63XDb2JUIUZN9LoMKpcL4ZVlk6HtIaKFh12vAAcD0g_zB0VBeDyQUm-nbM37ow1YI8IBAXjyMjjGkFRQ`,
-      }
-    : {},
+// ---- basic request logger (remove after debugging)
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log("Body:", JSON.stringify(req.body, null, 2));
+  }
+  next();
 });
 
-// -------------------------------
-// Utility helpers
-// -------------------------------
-const ok = (data) => ({ ok: true, data });
-const fail = (message, status = 424, meta = {}) => ({
-  ok: false,
-  error: { message, status, ...meta },
+// ---- CORS (Agent Builder runs at https://platform.openai.com)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.setHeader("Access-Control-Max-Age", "600");
+  res.setHeader("Cache-Control", "no-store");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
 });
 
+const PORT = process.env.PORT || 4000;
+const ERP_BASE = (
+  process.env.ERP_BASE || "https://jetrealty.gorealla.ai"
+).replace(/\/$/, "");
+const ERP_TOKEN = process.env.ERP_TOKEN || ""; // Prefer env; don't hardcode secrets
+
+// Allowed statuses (validated for PUT /status and combined PUT)
 const VALID_STATUSES = [
   "Not Started",
   "In Progress",
@@ -49,10 +41,280 @@ const VALID_STATUSES = [
   "On Hold",
 ];
 
-// -------------------------------
-// Tool implementations
-// -------------------------------
-async function searchNodesArray(args) {
+// ----------------- Core HTTP helper -----------------
+async function erp(path, { method = "GET", body, query } = {}) {
+  const url = new URL(`${ERP_BASE}${path}`);
+  if (query && typeof query === "object") {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+    }
+  }
+
+  const headers = {
+    "Content-Type": "application/json",
+  };
+  if (ERP_TOKEN) headers["Authorization"] = `Bearer ${ERP_TOKEN}`;
+
+  const res = await fetch(url.toString(), {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
+  if (!res.ok) throw { status: res.status, data };
+  return data;
+}
+
+// ----------------- Tool Catalog -----------------
+function toolCatalog() {
+  return [
+    {
+      name: "searchNodesArray",
+      description:
+        "GET /api/v1/projects/nodes/search/searchNodesArray → search nodes by keyword; returns results in data.content",
+      inputSchema: {
+        type: "object",
+        properties: {
+          keywords: { type: "string" },
+          page: { type: "integer" },
+          size: { type: "integer" },
+          sort: { type: "string" },
+          includePaths: { type: "boolean" },
+          includeStakeholders: { type: "boolean" },
+        },
+        required: ["keywords"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "updateNodeStatus",
+      description:
+        "PUT /api/v1/projects/nodes/{nodeId}/status → update only status. Allowed: Not Started, In Progress, Blocked, Completed, On Hold",
+      inputSchema: {
+        type: "object",
+        properties: {
+          nodeId: { type: "string" },
+          status: { type: "string" },
+        },
+        required: ["nodeId", "status"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "updateNode",
+      description:
+        "PUT /api/v1/projects/nodes/{nodeId} → update status and/or nodeDescription (and optionally parentNodeId).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          nodeId: { type: "string" },
+          status: { type: "string" },
+          nodeDescription: { type: "string" },
+          parentNodeId: { type: "string" },
+        },
+        required: ["nodeId"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "finalizeAfterUpload",
+      description:
+        "Helper: call after your UI uploads the file to /api/v1/gallery/upload and you have nodeId (and maybe parentNodeId). If only status is provided → uses /status; else uses combined PUT.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          nodeId: { type: "string" },
+          update: {
+            type: "object",
+            properties: {
+              status: { type: "string" },
+              nodeDescription: { type: "string" },
+              parentNodeId: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+        required: ["nodeId"],
+        additionalProperties: false,
+      },
+    },
+  ];
+}
+
+// ----------------- JSON-RPC surface -----------------
+
+// health
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "jetrealty-media-mcp",
+    mcp: {
+      version: "1.0.0",
+      name: "JetRealty Media MCP",
+      description: "MCP server for node search and post-upload updates",
+    },
+  });
+});
+
+// root JSON-RPC multiplexer
+app.post("/", async (req, res) => {
+  const { id, method, params } = req.body || {};
+
+  try {
+    if (method === "initialize") {
+      const protocolVersion = params?.protocolVersion || "2025-06-18";
+      const clientInfo = params?.clientInfo || {};
+      console.log(
+        `Initialize from ${
+          clientInfo.name || "client"
+        } proto=${protocolVersion}`
+      );
+      return res.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion,
+          capabilities: { tools: {}, resources: {}, prompts: {} },
+          serverInfo: { name: "jetrealty-media-mcp", version: "1.0.0" },
+        },
+      });
+    }
+
+    if (method === "tools/list") {
+      return res.json({ jsonrpc: "2.0", id, result: { tools: toolCatalog() } });
+    }
+
+    if (method === "tools/call") {
+      const { name, arguments: args = {} } = params || {};
+      const result = await handleToolCall(name, args);
+      return res.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text:
+                typeof result === "string"
+                  ? result
+                  : JSON.stringify(result, null, 2),
+            },
+          ],
+        },
+      });
+    }
+
+    return res.json({
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: `Method not found: ${method}` },
+    });
+  } catch (err) {
+    console.error("RPC error:", err);
+    return res.json({
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: err?.message || err,
+      },
+    });
+  }
+});
+
+// explicit endpoints
+app.post("/initialize", (req, res) => {
+  const id = req.body?.id ?? null;
+  const protocolVersion = req.body?.params?.protocolVersion || "2025-06-18";
+  res.json({
+    jsonrpc: "2.0",
+    id,
+    result: {
+      protocolVersion,
+      capabilities: { tools: {}, resources: {}, prompts: {} },
+      serverInfo: { name: "jetrealty-media-mcp", version: "1.0.0" },
+    },
+  });
+});
+
+app.post("/tools/list", (req, res) => {
+  const id = req.body?.id ?? null;
+  res.json({ jsonrpc: "2.0", id, result: { tools: toolCatalog() } });
+});
+
+app.post("/tools/call", async (req, res) => {
+  const id = req.body?.id ?? null;
+  const { name, arguments: args = {} } = req.body?.params || {};
+  try {
+    const result = await handleToolCall(name, args);
+    res.json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        content: [
+          {
+            type: "text",
+            text:
+              typeof result === "string"
+                ? result
+                : JSON.stringify(result, null, 2),
+          },
+        ],
+      },
+    });
+  } catch (err) {
+    console.error("Tool call error:", err);
+    res.json({
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32603,
+        message: "Tool execution failed",
+        data: err?.message || err,
+      },
+    });
+  }
+});
+
+app.options("/initialize", (_req, res) => res.sendStatus(204));
+app.options("/tools/list", (_req, res) => res.sendStatus(204));
+app.options("/tools/call", (_req, res) => res.sendStatus(204));
+app.options("/mcp", (_req, res) => res.sendStatus(204));
+
+// GET for quick check
+app.get("/tools", (_req, res) => res.json({ tools: toolCatalog() }));
+
+// ----------------- Tool executors -----------------
+async function handleToolCall(name, args) {
+  console.log(
+    `Executing tool: ${name} with args:`,
+    JSON.stringify(args, null, 2)
+  );
+
+  switch (name) {
+    case "searchNodesArray":
+      return await toolSearchNodesArray(args);
+    case "updateNodeStatus":
+      return await toolUpdateNodeStatus(args);
+    case "updateNode":
+      return await toolUpdateNode(args);
+    case "finalizeAfterUpload":
+      return await toolFinalizeAfterUpload(args);
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+// GET /projects/nodes/search/searchNodesArray
+async function toolSearchNodesArray(args = {}) {
   const {
     keywords,
     page = 0,
@@ -60,254 +322,105 @@ async function searchNodesArray(args) {
     sort = "insertDate,ASC",
     includePaths = true,
     includeStakeholders = true,
-  } = args || {};
+  } = args;
 
   if (!keywords || String(keywords).trim().length === 0) {
-    return fail("'keywords' is required.");
+    throw new Error("'keywords' is required");
   }
 
-  try {
-    const res = await http.get(
-      "/api/v1/projects/nodes/search/searchNodesArray",
-      {
-        params: {
-          keywords,
-          page,
-          size,
-          sort,
-          includePaths,
-          includeStakeholders,
-        },
-      }
-    );
+  const data = await erp("/api/v1/projects/nodes/search/searchNodesArray", {
+    method: "GET",
+    query: { keywords, page, size, sort, includePaths, includeStakeholders },
+  });
 
-    const raw = res?.data || {};
-    const content = raw?.data?.content ?? [];
+  const content = data?.data?.content ?? [];
+  const options = content.map((n) => ({
+    nodeId: n.recCode,
+    nodeName: n.nodeName,
+    nodeTypeName: n.nodeTypeName,
+    treeLevel: n.treeLevel,
+    // treePath may be a JSON string; parse safely
+    treePath: safeParseJSON(n.treePath, []),
+    status: n.status,
+    parentNodeId: n.parentNodeId || null,
+    rootNodeId: n.rootNodeId || null,
+  }));
 
-    // map minimal selection list for UI + include full items
-    const options = content.map((n) => ({
-      nodeId: n.recCode,
-      nodeName: n.nodeName,
-      nodeTypeName: n.nodeTypeName,
-      treeLevel: n.treeLevel,
-      // Convert treePath JSON string to array for convenience when present
-      treePath: safeParseJSON(n.treePath, []),
-      status: n.status,
-      parentNodeId: n.parentNodeId || null,
-      rootNodeId: n.rootNodeId || null,
-    }));
-
-    return ok({
-      total: raw?.data?.totalElements ?? options.length,
-      page: raw?.data?.pageable?.pageNumber ?? 0,
-      size: raw?.data?.pageable?.pageSize ?? options.length,
-      options,
-      raw,
-    });
-  } catch (err) {
-    return axiosToFail(err, "System search error");
-  }
+  return {
+    total: data?.data?.totalElements ?? options.length,
+    page: data?.data?.pageable?.pageNumber ?? 0,
+    size: data?.data?.pageable?.pageSize ?? options.length,
+    options,
+    raw: data,
+  };
 }
 
-async function updateNodeStatus(args) {
-  const { nodeId, status } = args || {};
-  if (!nodeId) return fail("'nodeId' is required.");
-  if (!status) return fail("'status' is required.");
+// PUT /projects/nodes/{nodeId}/status
+async function toolUpdateNodeStatus(args = {}) {
+  const { nodeId, status } = args;
+  if (!nodeId) throw new Error("'nodeId' is required");
+  if (!status) throw new Error("'status' is required");
   if (!VALID_STATUSES.includes(status)) {
-    return fail(`Invalid status. Allowed: ${VALID_STATUSES.join(", ")}`);
+    throw new Error(`Invalid status. Allowed: ${VALID_STATUSES.join(", ")}`);
   }
-  try {
-    const res = await http.put(`/api/v1/projects/nodes/${nodeId}/status`, {
-      status,
-    });
-    return ok({ updated: true, raw: res?.data });
-  } catch (err) {
-    return axiosToFail(err, "Failed to update node status");
-  }
+  const data = await erp(`/api/v1/projects/nodes/${nodeId}/status`, {
+    method: "PUT",
+    body: { status },
+  });
+  return { updated: true, raw: data };
 }
 
-// PUT nodes/{nodeId} — supports partial fields (backend should ignore undefined)
-async function updateNode(args) {
-  const { nodeId, parentNodeId, nodeDescription, status } = args || {};
-  if (!nodeId) return fail("'nodeId' is required.");
-
-  // optional validation for status when provided
+// PUT /projects/nodes/{nodeId}
+async function toolUpdateNode(args = {}) {
+  const { nodeId, status, nodeDescription, parentNodeId } = args;
+  if (!nodeId) throw new Error("'nodeId' is required");
   if (status && !VALID_STATUSES.includes(status)) {
-    return fail(`Invalid status. Allowed: ${VALID_STATUSES.join(", ")}`);
+    throw new Error(`Invalid status. Allowed: ${VALID_STATUSES.join(", ")}`);
   }
 
-  // Build the body only with present keys
   const body = {};
-  if (typeof parentNodeId === "string") body.parentNodeId = parentNodeId;
   if (typeof nodeDescription === "string")
     body.nodeDescription = nodeDescription;
   if (typeof status === "string") body.status = status;
+  if (typeof parentNodeId === "string") body.parentNodeId = parentNodeId;
 
-  try {
-    const res = await http.put(`/api/v1/projects/nodes/${nodeId}`, body);
-    return ok({ updated: true, raw: res?.data });
-  } catch (err) {
-    return axiosToFail(err, "Failed to update node");
-  }
+  const data = await erp(`/api/v1/projects/nodes/${nodeId}`, {
+    method: "PUT",
+    body,
+  });
+  return { updated: true, raw: data };
 }
 
-// Helper that executes the post-upload sequence depending on user intent.
-// This DOES NOT upload files. It expects you already uploaded via /api/v1/gallery/upload
-// and you pass the resulting nodeId (and optional parentNodeId if your API requires it).
-async function finalizeAfterUpload(args) {
-  const { nodeId, update = {} } = args || {};
-  if (!nodeId) return fail("'nodeId' (from upload response) is required.");
+// Helper: upload-first flow finisher
+async function toolFinalizeAfterUpload(args = {}) {
+  const { nodeId, update = {} } = args;
+  if (!nodeId) throw new Error("'nodeId' is required");
 
   const { status, nodeDescription, parentNodeId } = update;
 
-  // If only status, call status API first (your requirement: upload → then status/description)
+  // If only status is provided → use status endpoint
   if (status && !nodeDescription && parentNodeId === undefined) {
-    return updateNodeStatus({ nodeId, status });
+    return await toolUpdateNodeStatus({ nodeId, status });
   }
 
-  // If both status and description (and/or parentNodeId), call the combined PUT
-  if (status || nodeDescription || typeof parentNodeId === "string") {
-    return updateNode({ nodeId, status, nodeDescription, parentNodeId });
+  // If any of (status, nodeDescription, parentNodeId) → combined PUT
+  if (
+    status ||
+    typeof nodeDescription === "string" ||
+    typeof parentNodeId === "string"
+  ) {
+    return await toolUpdateNode({
+      nodeId,
+      status,
+      nodeDescription,
+      parentNodeId,
+    });
   }
 
-  return ok({ message: "Nothing to update after upload." });
+  return { message: "Nothing to update after upload." };
 }
 
-// -------------------------------
-// JSON-RPC style surface for MCP
-// -------------------------------
-
-const TOOLBOX = {
-  searchNodesArray: {
-    name: "searchNodesArray",
-    description:
-      "GET /api/v1/projects/nodes/search/searchNodesArray → search nodes by keyword and return selection options.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        keywords: { type: "string" },
-        page: { type: "integer" },
-        size: { type: "integer" },
-        sort: { type: "string" },
-        includePaths: { type: "boolean" },
-        includeStakeholders: { type: "boolean" },
-      },
-      required: ["keywords"],
-      additionalProperties: false,
-    },
-  },
-  updateNodeStatus: {
-    name: "updateNodeStatus",
-    description:
-      "PUT /api/v1/projects/nodes/{nodeId}/status → update a node's status. Allowed: Not Started, In Progress, Blocked, Completed, On Hold",
-    inputSchema: {
-      type: "object",
-      properties: {
-        nodeId: { type: "string" },
-        status: { type: "string" },
-      },
-      required: ["nodeId", "status"],
-      additionalProperties: false,
-    },
-  },
-  updateNode: {
-    name: "updateNode",
-    description:
-      "PUT /api/v1/projects/nodes/{nodeId} → update nodeDescription and/or status (and optionally parentNodeId).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        nodeId: { type: "string" },
-        parentNodeId: { type: "string" },
-        nodeDescription: { type: "string" },
-        status: { type: "string" },
-      },
-      required: ["nodeId"],
-      additionalProperties: false,
-    },
-  },
-  finalizeAfterUpload: {
-    name: "finalizeAfterUpload",
-    description:
-      "Helper: after the frontend uploads the file and obtains nodeId (and maybe parentNodeId), call this to apply status/description updates. This server does not upload files.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        nodeId: { type: "string" },
-        update: {
-          type: "object",
-          properties: {
-            status: { type: "string" },
-            nodeDescription: { type: "string" },
-            parentNodeId: { type: "string" },
-          },
-          additionalProperties: false,
-        },
-      },
-      required: ["nodeId"],
-      additionalProperties: false,
-    },
-  },
-};
-
-app.post("/tools", (_req, res) => {
-  res.json({ tools: Object.values(TOOLBOX) });
-});
-
-app.post("/call", async (req, res) => {
-  try {
-    const { toolName, arguments: args } = req.body || {};
-    if (!toolName || !TOOLBOX[toolName]) {
-      return res
-        .status(400)
-        .json(fail("Unknown or missing 'toolName' in request.", 400));
-    }
-
-    let result;
-    switch (toolName) {
-      case "searchNodesArray":
-        result = await searchNodesArray(args);
-        break;
-      case "updateNodeStatus":
-        result = await updateNodeStatus(args);
-        break;
-      case "updateNode":
-        result = await updateNode(args);
-        break;
-      case "finalizeAfterUpload":
-        result = await finalizeAfterUpload(args);
-        break;
-      default:
-        return res
-          .status(400)
-          .json(fail(`Tool '${toolName}' not implemented.`, 400));
-    }
-
-    // Map tool failures to HTTP 424 so Agent Builder can show a helpful toast
-    if (!result.ok) {
-      const code = result.error?.status || 424;
-      return res.status(code).json(result);
-    }
-
-    res.json(result);
-  } catch (err) {
-    const f = axiosToFail(err, "Unhandled tool error");
-    const code = f.error?.status || 424;
-    res.status(code).json(f);
-  }
-});
-
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", baseUrl: BASE_URL });
-});
-
-app.listen(PORT, () => {
-  console.log(`MCP server listening on :${PORT}`);
-});
-
-// -------------------------------
-// Helpers
-// -------------------------------
+// ----------------- Utils -----------------
 function safeParseJSON(str, fallback) {
   try {
     if (typeof str !== "string") return fallback;
@@ -317,17 +430,8 @@ function safeParseJSON(str, fallback) {
   }
 }
 
-function axiosToFail(err, prefix = "") {
-  const isAxios = !!err?.isAxiosError || !!err?.response || !!err?.request;
-  if (!isAxios) return fail(prefix || err?.message || "Unknown error");
-  const status = err?.response?.status || 424;
-  const data = err?.response?.data;
-  const url = err?.config?.url;
-  const method = err?.config?.method;
-  const params = err?.config?.params;
-  const info = { status, url, method, params, data };
-  const msg = `${prefix}${prefix ? ": " : ""}${
-    data?.message || err?.message || "Request failed"
-  }`;
-  return fail(msg, status, info);
-}
+app.listen(PORT, () => {
+  console.log(`MCP adapter listening on :${PORT}`);
+  console.log(`ERP_BASE=${ERP_BASE}`);
+  console.log(`Ready for OpenAI MCP connections`);
+});
