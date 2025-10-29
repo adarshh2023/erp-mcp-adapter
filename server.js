@@ -59,16 +59,11 @@ async function erp(path, { method = "GET", body, query } = {}) {
   const started = Date.now();
   let res, text;
   try {
-    console.log(`ERP Request: ${method} ${url.toString()}`);
-    console.log("body:", body ? JSON.stringify(body) : "N/A");
-    res = await fetch(
-      "https://gorealla.heptanesia.com/api/v1/projects/nodes/search/searchNodesArray?keywords=kidsarea&page=0&size=50&sort=insertDate%2CASC&includePaths=true&includeStakeholders=true",
-      {
-        method,
-        headers,
-        body: body ? JSON.stringify(body) : undefined,
-      }
-    );
+    res = await fetch(url.toString(), {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
     text = await res.text();
   } catch (networkErr) {
     const ms = Date.now() - started;
@@ -355,18 +350,17 @@ async function handleToolCall(name, args) {
 
 // GET /projects/nodes/search/searchNodesArray
 async function toolSearchNodesArray(args = {}) {
-  const {
-    keywords,
-    page = 0,
-    size = 50,
-    sort = "insertDate,ASC",
-    includePaths = true,
-    includeStakeholders = true,
-  } = args;
-
+  const { keywords } = args;
   if (!keywords || String(keywords).trim().length === 0) {
     throw new Error("'keywords' is required");
   }
+
+  // Enforce canonical query params regardless of caller defaults
+  const page = 0;
+  const size = 50;
+  const sort = "insertDate,ASC"; // will be encoded as insertDate%2CASC by URLSearchParams
+  const includePaths = true;
+  const includeStakeholders = true;
 
   let data;
   try {
