@@ -53,7 +53,10 @@ async function erp(path, { method = "GET", body, query } = {}) {
   const headers = {
     "Content-Type": "application/json",
   };
-  if (ERP_TOKEN) headers["Authorization"] = `Bearer ${ERP_TOKEN}`;
+  if (ERP_TOKEN)
+    headers[
+      "Authorization"
+    ] = `Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MTcyNzQzOCwiZXhwIjoxNzYxODEzODM4fQ.kqg71O63XDb2JUIUZN9LoMKpcL4ZVlk6HtIaKFh12vAAcD0g_zB0VBeDyQUm-nbM37ow1YI8IBAXjyMjjGkFRQ`;
 
   const res = await fetch(url.toString(), {
     method,
