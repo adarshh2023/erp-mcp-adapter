@@ -50,28 +50,62 @@ async function erp(path, { method = "GET", body, query } = {}) {
     }
   }
 
-  const headers = {
-    "Content-Type": "application/json",
-  };
+  const headers = { "Content-Type": "application/json" };
   if (ERP_TOKEN)
     headers[
       "Authorization"
     ] = `Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MTcyNzQzOCwiZXhwIjoxNzYxODEzODM4fQ.kqg71O63XDb2JUIUZN9LoMKpcL4ZVlk6HtIaKFh12vAAcD0g_zB0VBeDyQUm-nbM37ow1YI8IBAXjyMjjGkFRQ`;
 
-  const res = await fetch(url.toString(), {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const started = Date.now();
+  let res, text;
+  try {
+    console.log(`ERP Request: ${method} ${url.toString()}`);
+    console.log("body:", body ? JSON.stringify(body) : "N/A");
+    res = await fetch(url.toString(), {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    text = await res.text();
+  } catch (networkErr) {
+    const ms = Date.now() - started;
+    throw {
+      status: 0,
+      data: {
+        message: `Network error after ${ms}ms to ${url.toString()}`,
+        detail: String(networkErr?.message || networkErr),
+      },
+    };
+  }
 
-  const text = await res.text();
   let data;
   try {
     data = JSON.parse(text);
   } catch {
     data = { raw: text };
   }
-  if (!res.ok) throw { status: res.status, data };
+
+  const backendStatus = (data && (data.status || data.Status)) || undefined;
+  const backendSuccess =
+    data && (data.success !== undefined ? data.success : undefined);
+  const isBackendError =
+    backendStatus && String(backendStatus).toUpperCase() !== "SUCCESS";
+
+  if (!res.ok || isBackendError || backendSuccess === false) {
+    throw {
+      status: res.status || 500,
+      data: {
+        message: data?.message || "An unexpected error occurred",
+        backendStatus,
+        backendSuccess,
+        payload: data,
+        httpStatus: res.status,
+        url: url.toString(),
+        method,
+      },
+    };
+  }
+
   return data;
 }
 
@@ -331,10 +365,17 @@ async function toolSearchNodesArray(args = {}) {
     throw new Error("'keywords' is required");
   }
 
-  const data = await erp("/api/v1/projects/nodes/search/searchNodesArray", {
-    method: "GET",
-    query: { keywords, page, size, sort, includePaths, includeStakeholders },
-  });
+  let data;
+  try {
+    data = await erp("/api/v1/projects/nodes/search/searchNodesArray", {
+      method: "GET",
+      query: { keywords, page, size, sort, includePaths, includeStakeholders },
+    });
+  } catch (e) {
+    const msg = e?.data?.message || e?.message || "Search failed";
+    const httpStatus = e?.status || e?.data?.httpStatus || 424;
+    throw new Error(`Search error (${httpStatus}): ${msg}`);
+  }
 
   const content = data?.data?.content ?? [];
   const options = content.map((n) => ({
@@ -342,7 +383,6 @@ async function toolSearchNodesArray(args = {}) {
     nodeName: n.nodeName,
     nodeTypeName: n.nodeTypeName,
     treeLevel: n.treeLevel,
-    // treePath may be a JSON string; parse safely
     treePath: safeParseJSON(n.treePath, []),
     status: n.status,
     parentNodeId: n.parentNodeId || null,
