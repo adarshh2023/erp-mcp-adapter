@@ -61,11 +61,14 @@ async function erp(path, { method = "GET", body, query } = {}) {
   try {
     console.log(`ERP Request: ${method} ${url.toString()}`);
     console.log("body:", body ? JSON.stringify(body) : "N/A");
-    res = await fetch(url.toString(), {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    res = await fetch(
+      "https://gorealla.heptanesia.com/api/v1/projects/nodes/search/searchNodesArray?keywords=kidsarea&page=0&size=50&sort=insertDate%2CASC&includePaths=true&includeStakeholders=true",
+      {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      }
+    );
     text = await res.text();
   } catch (networkErr) {
     const ms = Date.now() - started;
