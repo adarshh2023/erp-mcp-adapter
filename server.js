@@ -28,7 +28,7 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 4000;
 const ERP_BASE = (
-  process.env.ERP_BASE || "https://jetrealty.gorealla.ai"
+  process.env.ERP_BASE || "https://gorealla.heptanesia.com"
 ).replace(/\/$/, "");
 const ERP_TOKEN = process.env.ERP_TOKEN || ""; // Prefer env; don't hardcode secrets
 
@@ -54,7 +54,7 @@ async function erp(path, { method = "GET", body, query } = {}) {
   if (ERP_TOKEN)
     headers[
       "Authorization"
-    ] = `Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MTcyNzQzOCwiZXhwIjoxNzYxODEzODM4fQ.kqg71O63XDb2JUIUZN9LoMKpcL4ZVlk6HtIaKFh12vAAcD0g_zB0VBeDyQUm-nbM37ow1YI8IBAXjyMjjGkFRQ`;
+    ] = `Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MTgwMjA4NywiZXhwIjoxNzYxODg4NDg3fQ.6wxoa1oWSa4-pD_w9kfPZYwfv7rxcdIQo-6SxdkOZJNMruSg8Iwu4ytTbpXtwdi98uKuDccrEgyiUXfxmRLuKg`;
 
   const started = Date.now();
   let res, text;
