@@ -54,7 +54,7 @@ async function erp(path, { method = "GET", body, query } = {}) {
   if (ERP_TOKEN)
     headers[
       "Authorization"
-    ] = `Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MTgwMjA4NywiZXhwIjoxNzYxODg4NDg3fQ.6wxoa1oWSa4-pD_w9kfPZYwfv7rxcdIQo-6SxdkOZJNMruSg8Iwu4ytTbpXtwdi98uKuDccrEgyiUXfxmRLuKg`;
+    ] = `Bearer eyJhbGciOiJIUzUxMiJ9.eyJyb2xlIjoiQWRtaW4iLCJjdXN0b21lcklkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwidXNlcklkIjoiMDM0YzdjZmQtNGU0Ny00ZTAzLWE2NGYtODc0ZjEyMjk1NmIwIiwiY3VzdG9tZXJOYW1lIjoiSmV0IFJlYWx0eSBMaW1pdGVkIiwic3ViIjoiOTgyMDE4OTcxOSIsImlzcyI6ImdvcmVhbGxhLWRldmVsb3BlciIsImlhdCI6MTc2MTg5MjAzOSwiZXhwIjoxNzYxOTc4NDM5fQ.eCWpo4_xEh7OeRvWBRiHEeiGFjoDp06U9MYPQ6L-IQQg6lVRe4SExLAtxQ_m3wVm42abUzR4vN1EDEhm7aOJpQ`;
 
   const started = Date.now();
   let res, text;
